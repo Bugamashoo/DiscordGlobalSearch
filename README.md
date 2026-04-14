@@ -4,6 +4,8 @@ A console script that adds a search overlay to the Discord desktop client, letti
 
 Discord's built-in search only works on one server at a time. This script loops through every server you select, pulls every page of results for your query, merges them into a single chronological list, and gives you clickable links that jump straight to each message in the Discord client.
 
+DISCLAIMER: This readme was written by an LLM based on my specific instructions. Pasting a script into a javascript console is INHERENTLY RISKY. I wrote this script as a helpful tool but you should always verify the content of scripts just in case
+
 ---
 
 ## Table of contents
