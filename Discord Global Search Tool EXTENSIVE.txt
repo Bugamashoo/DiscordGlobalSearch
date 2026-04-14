@@ -1,0 +1,423 @@
+(() => {
+  // ---------- Webpack access ----------
+  let _wpRequire = null;
+  const wp = () => {
+    if (_wpRequire) return _wpRequire;
+    _wpRequire = window.webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
+    window.webpackChunkdiscord_app.pop();
+    return _wpRequire;
+  };
+
+  const candidatesOf = (mod) => {
+    if (!mod?.exports) return [];
+    const out = [mod.exports];
+    try {
+      for (const k of Object.keys(mod.exports)) {
+        const v = mod.exports[k];
+        if (v && typeof v === "object") out.push(v);
+      }
+    } catch (e) {}
+    return out;
+  };
+
+  const findModule = (filter) => {
+    const wpRequire = wp();
+    for (const id in wpRequire.c) {
+      try {
+        for (const exp of candidatesOf(wpRequire.c[id])) {
+          try { if (filter(exp)) return exp; } catch (e) {}
+        }
+      } catch (e) {}
+    }
+    return null;
+  };
+
+  const findByFilters = (filters) => {
+    for (const f of filters) {
+      const m = findModule(f);
+      if (m) return m;
+    }
+    return null;
+  };
+
+  // ---------- Token ----------
+  const getToken = () => {
+    const mod = findByFilters([
+      m => typeof m.getToken === "function" && typeof m.setToken === "function" && typeof m.hideToken === "function",
+      m => typeof m.getToken === "function" && typeof m.getId === "function" && typeof m.getEmail === "function",
+      m => typeof m.getToken === "function" && typeof m.setToken === "function",
+      m => typeof m.getToken === "function" && typeof m.getAnalyticsToken === "function",
+    ]);
+    if (!mod) return null;
+    try { return mod.getToken(); } catch (e) { return null; }
+  };
+
+  // ---------- Guilds ----------
+  const getGuilds = () => {
+    const mod = findByFilters([
+      m => typeof m.getGuild === "function" && typeof m.getGuilds === "function" && typeof m.getGuildCount === "function",
+      m => typeof m.getGuild === "function" && typeof m.getGuilds === "function",
+      m => typeof m.getGuilds === "function",
+    ]);
+    if (!mod) return [];
+    try {
+      const guilds = mod.getGuilds();
+      return Object.values(guilds || {})
+        .filter(g => g && g.id && g.name)
+        .map(g => ({ id: g.id, name: g.name }));
+    } catch (e) {
+      return [];
+    }
+  };
+
+  // ---------- Navigation ----------
+  const getTransitionTo = () => {
+    const mod = findByFilters([
+      m => typeof m.transitionTo === "function" && typeof m.replaceWith === "function",
+      m => typeof m.transitionTo === "function",
+    ]);
+    return mod ? mod.transitionTo.bind(mod) : null;
+  };
+
+  const getSelectChannel = () => {
+    const mod = findByFilters([
+      m => typeof m.selectChannel === "function" && typeof m.selectVoiceChannel === "function",
+      m => typeof m.selectChannel === "function",
+    ]);
+    return mod ? mod.selectChannel.bind(mod) : null;
+  };
+
+  const transitionTo = getTransitionTo();
+  const selectChannel = getSelectChannel();
+
+  const jumpToMessage = (guildId, channelId, messageId) => {
+    const path = `/channels/${guildId}/${channelId}/${messageId}`;
+    try { if (transitionTo) { transitionTo(path); return; } } catch (e) {}
+    try { if (selectChannel) { selectChannel({ guildId, channelId, messageId }); return; } } catch (e) {}
+    try {
+      window.history.pushState({}, "", path);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    } catch (e) { console.error("[xsearch] no navigation method worked", e); }
+  };
+
+  // ---------- Init ----------
+  const token = getToken();
+  if (!token) { console.error("[xsearch] Could not retrieve token."); return; }
+
+  const guilds = getGuilds().sort((a, b) => a.name.localeCompare(b.name));
+  if (guilds.length === 0) { console.error("[xsearch] Found 0 guilds."); return; }
+  console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel)}`);
+
+  // ---------- Overlay ----------
+  document.getElementById("xsearch-overlay")?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.id = "xsearch-overlay";
+  overlay.innerHTML = `
+    <style>
+      #xsearch-overlay { position: fixed; top: 50px; right: 50px; width: 760px; max-width: 90vw; background: #2b2d31; color: #dbdee1; border: 1px solid #1e1f22; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 99999; font-family: system-ui, sans-serif; display: flex; flex-direction: column; }
+      #xsearch-overlay.expanded { height: 750px; max-height: 88vh; }
+      #xsearch-header { padding: 10px 14px; background: #1e1f22; cursor: move; display: flex; justify-content: space-between; align-items: center; user-select: none; border-radius: 8px 8px 0 0; }
+      #xsearch-overlay:not(.expanded) #xsearch-header { border-radius: 8px; }
+      #xsearch-header strong { font-size: 14px; }
+      #xsearch-header-actions { display: flex; gap: 6px; align-items: center; }
+      #xsearch-toggle, #xsearch-close { color: #fff; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+      #xsearch-toggle { background: #4e5058; }
+      #xsearch-close { background: #ed4245; }
+      #xsearch-body { padding: 14px; overflow-y: auto; flex: 1; }
+      #xsearch-overlay:not(.expanded) #xsearch-body { display: none; }
+      #xsearch-overlay input[type=text] { width: 100%; padding: 9px 12px; background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
+      #xsearch-controls { display: flex; gap: 8px; margin-top: 8px; }
+      #xsearch-overlay button.act { padding: 8px 14px; background: #5865f2; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+      #xsearch-overlay button.act.alt { background: #3ba55d; }
+      #xsearch-overlay button.act.ghost { background: #4e5058; }
+      #xsearch-overlay button.act:disabled { opacity: 0.5; cursor: not-allowed; }
+
+      /* Server picker */
+      #xsearch-servers-wrap { background: #1e1f22; border-radius: 6px; margin: 12px 0; border: 1px solid #2b2d31; }
+      #xsearch-servers-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid #2b2d31; }
+      #xsearch-servers-head .lbl { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #b5bac1; font-weight: 600; }
+      #xsearch-servers-head .mini { background: transparent; color: #5865f2; border: none; cursor: pointer; font-size: 12px; padding: 2px 6px; }
+      #xsearch-servers-head .mini:hover { color: #818cf8; }
+      #xsearch-servers { padding: 8px; max-height: 240px; overflow-y: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
+      #xsearch-servers label { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; cursor: pointer; color: #dbdee1; transition: background 0.1s; min-width: 0; }
+      #xsearch-servers label:hover { background: #2b2d31; }
+      #xsearch-servers label span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #xsearch-servers input[type=checkbox] { appearance: none; width: 16px; height: 16px; border: 1.5px solid #4e5058; border-radius: 3px; background: #2b2d31; cursor: pointer; flex-shrink: 0; position: relative; }
+      #xsearch-servers input[type=checkbox]:checked { background: #5865f2; border-color: #5865f2; }
+      #xsearch-servers input[type=checkbox]:checked::after { content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+
+      #xsearch-status { font-size: 12px; color: #b5bac1; margin: 8px 0; }
+      #xsearch-progress-wrap { background: #1e1f22; border-radius: 4px; height: 14px; margin: 6px 0; overflow: hidden; display: none; }
+      #xsearch-progress-bar { background: #5865f2; height: 100%; width: 0%; transition: width 0.2s ease; }
+      #xsearch-overlay .msg { background: #313338; padding: 10px; border-radius: 4px; margin: 6px 0; cursor: pointer; border-left: 3px solid #5865f2; }
+      #xsearch-overlay .msg:hover { background: #383a40; }
+      #xsearch-overlay .msg .meta { font-size: 11px; color: #b5bac1; margin-bottom: 4px; }
+      #xsearch-overlay .msg .content { font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+    <div id="xsearch-header">
+      <strong>Cross-Server Search</strong>
+      <div id="xsearch-header-actions">
+        <button id="xsearch-toggle">Hide</button>
+        <button id="xsearch-close">Close</button>
+      </div>
+    </div>
+    <div id="xsearch-body">
+      <input id="xsearch-q" type="text" placeholder="Search query..." />
+      <div id="xsearch-controls">
+        <button class="act" id="xsearch-go">Search all pages</button>
+        <button class="act ghost" id="xsearch-stop" disabled>Stop</button>
+        <button class="act alt" id="xsearch-export" disabled>Export CSV</button>
+      </div>
+      <div id="xsearch-servers-wrap">
+        <div id="xsearch-servers-head">
+          <span class="lbl">Servers</span>
+          <div>
+            <button class="mini" id="xsearch-all">Select all</button>
+            <button class="mini" id="xsearch-none">Clear</button>
+          </div>
+        </div>
+        <div id="xsearch-servers"></div>
+      </div>
+      <div id="xsearch-status"></div>
+      <div id="xsearch-progress-wrap"><div id="xsearch-progress-bar"></div></div>
+      <div id="xsearch-results"></div>
+    </div>
+  `;
+  overlay.classList.add("expanded");
+  document.body.appendChild(overlay);
+
+  // Drag handling
+  const header = overlay.querySelector("#xsearch-header");
+  let dragging = false, dx = 0, dy = 0, dragMoved = false;
+  header.addEventListener("mousedown", e => {
+    if (e.target.tagName === "BUTTON") return;
+    dragging = true;
+    dragMoved = false;
+    const rect = overlay.getBoundingClientRect();
+    dx = e.clientX - rect.left;
+    dy = e.clientY - rect.top;
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", e => {
+    if (!dragging) return;
+    dragMoved = true;
+    overlay.style.left = (e.clientX - dx) + "px";
+    overlay.style.top = (e.clientY - dy) + "px";
+    overlay.style.right = "auto";
+  });
+  document.addEventListener("mouseup", () => dragging = false);
+
+  header.addEventListener("click", e => {
+    if (e.target.tagName === "BUTTON") return;
+    if (dragMoved) return;
+    overlay.classList.toggle("expanded");
+    overlay.querySelector("#xsearch-toggle").textContent = overlay.classList.contains("expanded") ? "Hide" : "Show";
+  });
+
+  overlay.querySelector("#xsearch-toggle").onclick = (e) => {
+    e.stopPropagation();
+    overlay.classList.toggle("expanded");
+    e.target.textContent = overlay.classList.contains("expanded") ? "Hide" : "Show";
+  };
+  overlay.querySelector("#xsearch-close").onclick = (e) => {
+    e.stopPropagation();
+    overlay.remove();
+  };
+
+  const serversDiv = overlay.querySelector("#xsearch-servers");
+  guilds.forEach(g => {
+    const lbl = document.createElement("label");
+    const safeName = g.name.replace(/</g, "&lt;");
+    lbl.innerHTML = `<input type="checkbox" data-id="${g.id}" checked><span title="${safeName}">${safeName}</span>`;
+    serversDiv.appendChild(lbl);
+  });
+
+  overlay.querySelector("#xsearch-all").onclick = () => {
+    serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = true);
+  };
+  overlay.querySelector("#xsearch-none").onclick = () => {
+    serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = false);
+  };
+
+  // ---------- Search ----------
+  let currentQuery = "";
+  let lastResults = [];
+  let stopRequested = false;
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const PAGE_DELAY = 2000;
+  const SERVER_DELAY = 4000;
+  const PAGE_SIZE = 25;
+
+  const renderResult = (m) => {
+    const results = overlay.querySelector("#xsearch-results");
+    const div = document.createElement("div");
+    div.className = "msg";
+    const date = new Date(m.timestamp).toLocaleString();
+    div.innerHTML = `<div class="meta">${m._guildName} #${m.channel_id} ${date} ${(m.author?.username || "?").replace(/</g, "&lt;")}</div>
+                     <div class="content"></div>`;
+    div.querySelector(".content").textContent = m.content || "(no text content)";
+    div.onclick = () => jumpToMessage(m._guildId, m.channel_id, m.id);
+    results.appendChild(div);
+  };
+
+  const search = async (query) => {
+    const checked = [...serversDiv.querySelectorAll("input:checked")].map(i => ({
+      id: i.dataset.id,
+      name: i.parentElement.querySelector("span").textContent.trim()
+    }));
+    if (checked.length === 0) { alert("Select at least one server."); return; }
+
+    const status = overlay.querySelector("#xsearch-status");
+    const results = overlay.querySelector("#xsearch-results");
+    const progressWrap = overlay.querySelector("#xsearch-progress-wrap");
+    const progressBar = overlay.querySelector("#xsearch-progress-bar");
+    const exportBtn = overlay.querySelector("#xsearch-export");
+    const goBtn = overlay.querySelector("#xsearch-go");
+    const stopBtn = overlay.querySelector("#xsearch-stop");
+
+    results.innerHTML = "";
+    progressWrap.style.display = "block";
+    progressBar.style.width = "0%";
+    exportBtn.disabled = true;
+    goBtn.disabled = true;
+    stopBtn.disabled = false;
+    stopRequested = false;
+    lastResults = [];
+
+    const all = [];
+    const total = checked.length;
+    let totalRequests = 0;
+    let completedRequests = 0;
+
+    outer:
+    for (let s = 0; s < total; s++) {
+      const g = checked[s];
+      let offset = 0;
+      let serverTotal = null;
+      let serverPage = 1;
+
+      while (true) {
+        if (stopRequested) break outer;
+        const pageInfo = serverTotal != null
+          ? `page ${serverPage} of ~${Math.ceil(serverTotal / PAGE_SIZE)}`
+          : `page ${serverPage}`;
+        status.textContent = `Server ${s + 1}/${total}: ${g.name} - ${pageInfo} (${all.length} results so far)`;
+
+        try {
+          const url = `https://discord.com/api/v9/guilds/${g.id}/messages/search?content=${encodeURIComponent(query)}&offset=${offset}`;
+          const res = await fetch(url, { headers: { authorization: token } });
+          if (res.status === 429) {
+            for (let countdown = 20; countdown > 0; countdown--) {
+              if (stopRequested) break outer;
+              status.textContent = `Rate limited (429) on ${g.name} page ${serverPage} - retrying in ${countdown}s...`;
+              await sleep(1000);
+            }
+            continue; // retry same offset/page
+          }
+          if (!res.ok) {
+            console.warn(`[xsearch] ${g.name} returned ${res.status}`);
+            break;
+          }
+          const data = await res.json();
+          if (serverTotal == null) {
+            serverTotal = data.total_results || 0;
+            // Estimate work remaining: assume each remaining server has at least 1 page
+            totalRequests = completedRequests + Math.max(1, Math.ceil(serverTotal / PAGE_SIZE)) + (total - s - 1);
+          }
+          const groups = data.messages || [];
+          if (groups.length === 0) break;
+
+          for (const group of groups) {
+            const hit = group.find(m => m.hit) || group[0];
+            if (hit) {
+              const enriched = { ...hit, _guildId: g.id, _guildName: g.name };
+              all.push(enriched);
+            }
+          }
+
+          completedRequests++;
+          progressBar.style.width = `${Math.min(100, (completedRequests / Math.max(1, totalRequests)) * 100)}%`;
+
+          // Last page reached?
+          offset += PAGE_SIZE;
+          if (offset >= serverTotal || groups.length < PAGE_SIZE) break;
+          serverPage++;
+
+          // Between pages of the same server
+          await sleep(PAGE_DELAY);
+        } catch (e) {
+          console.error(`[xsearch] ${g.name}`, e);
+          break;
+        }
+      }
+
+      // Between servers
+      if (s < total - 1 && !stopRequested) {
+        status.textContent = `Waiting before next server... (${all.length} results so far)`;
+        await sleep(SERVER_DELAY);
+      }
+    }
+
+    all.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    lastResults = all;
+    status.textContent = `${all.length} total results across ${total} servers${stopRequested ? " (stopped early)" : ""}`;
+    progressWrap.style.display = "none";
+    progressBar.style.width = "100%";
+    exportBtn.disabled = all.length === 0;
+    goBtn.disabled = false;
+    stopBtn.disabled = true;
+
+    for (const m of all) renderResult(m);
+  };
+
+  // ---------- CSV export ----------
+  const csvEscape = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+
+  const exportCsv = () => {
+    if (!lastResults.length) return;
+    const headers = ["timestamp", "server", "channel_id", "author", "content", "link"];
+    const rows = [headers.join(",")];
+    for (const m of lastResults) {
+      const link = `https://discord.com/channels/${m._guildId}/${m.channel_id}/${m.id}`;
+      rows.push([
+        csvEscape(m.timestamp),
+        csvEscape(m._guildName),
+        csvEscape(m.channel_id),
+        csvEscape(m.author?.username || ""),
+        csvEscape(m.content || ""),
+        csvEscape(link),
+      ].join(","));
+    }
+    const csv = "\ufeff" + rows.join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const safeQuery = currentQuery.replace(/[^a-z0-9]+/gi, "_").slice(0, 40) || "search";
+    a.href = url;
+    a.download = `discord_search_${safeQuery}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  overlay.querySelector("#xsearch-go").onclick = () => {
+    currentQuery = overlay.querySelector("#xsearch-q").value.trim();
+    if (!currentQuery) return;
+    search(currentQuery);
+  };
+  overlay.querySelector("#xsearch-stop").onclick = () => { stopRequested = true; };
+  overlay.querySelector("#xsearch-export").onclick = exportCsv;
+  overlay.querySelector("#xsearch-q").addEventListener("keydown", e => {
+    if (e.key === "Enter" && !overlay.querySelector("#xsearch-go").disabled) {
+      overlay.querySelector("#xsearch-go").click();
+    }
+  });
+})();
