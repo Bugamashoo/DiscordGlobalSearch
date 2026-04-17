@@ -1,22 +1,10 @@
 (() => {
-  // ================================================================
-  // FEATURE 4: Fetch + XHR interception for auth token and API version
-  // ================================================================
-  // Patch fetch and XHR immediately so we passively capture the
-  // Authorization header and API version from any outgoing Discord API
-  // request. Both patches are fully transparent and forward all calls to
-  // the originals. Restores itself once both values are captured.
+  // Patches fetch and XHR to passively capture the auth token, API version, and client metadata headers from Discord's own outgoing requests. Self-restores once enough data is collected.
   let _capturedToken = null;
   let _capturedApiVersion = null;
-  // Stealth headers captured from the real client: we replay these exact values
-  // so our search requests are header-by-header indistinguishable from Discord's
-  // own UI. Without these, requests look automation-shaped (no super-properties,
-  // no locale/timezone) which is one of the easier patterns to flag.
+  // Replaying these on our requests makes them look identical to normal Discord UI traffic.
   const _capturedHeaders = {};
-  // Header allowlist: only the metadata-shaped headers Discord sends from the
-  // client. We deliberately exclude content-length, content-type, cookie (the
-  // browser handles cookie automatically with credentials:include), referer,
-  // user-agent (the browser sets it), and any cache-control.
+  // Only grab the metadata headers Discord sends; skip anything the browser manages itself.
   const _stealthHeaderAllow = new Set([
     "x-super-properties",
     "x-discord-locale",
@@ -36,9 +24,7 @@
   };
 
   const _maybeRestore = () => {
-    // Stop intercepting once we have token + version + at least one stealth
-    // header. Keeps the patch surface tiny so we do not accidentally affect
-    // Discord's own performance.
+    // Stop intercepting once we have what we need - minimizes the time spent patching native APIs.
     if (_capturedToken && _capturedApiVersion && Object.keys(_capturedHeaders).length > 0) {
       _restoreNet();
     }
@@ -58,9 +44,7 @@
       if (m) _capturedApiVersion = m[1];
     }
     if (!_capturedToken && typeof authHeader === "string" && authHeader.length > 30) {
-      // Strip optional "Bearer " prefix; Discord user tokens are sent raw,
-      // but bot/oauth flows include the prefix. Normalize to whatever Discord
-      // currently accepts on the search endpoint (the raw header value).
+      // User tokens are sent raw; bot/OAuth tokens include "Bearer ". Strip it so the value is consistent.
       _capturedToken = authHeader.replace(/^Bearer\s+/i, "");
     }
     if (headerEntries) {
@@ -109,10 +93,7 @@
     return _origXHRSetHeader.apply(this, arguments);
   };
 
-  // ================================================================
-  // Webpack chunk discovery: try the known name first, then scan window
-  // for any property matching the webpackChunk* pattern in case Discord
-  // renames the app bundle
+  // Webpack chunk discovery - tries the known bundle name first, then scans window for any webpackChunk* property.
   const getWebpackChunk = () => {
     if (window.webpackChunkdiscord_app) return window.webpackChunkdiscord_app;
     for (const key of Object.getOwnPropertyNames(window)) {
@@ -126,9 +107,7 @@
   };
 
   let _wpRequire = null;
-  // Webpack chunk IDs are tracked in installedChunks; using Symbol() is fragile
-  // because newer webpack builds key chunks via Map keys and may type-check.
-  // Use a stable unique string ID instead so the push registers cleanly.
+  // Using a string chunk ID instead of Symbol() since newer webpack builds can reject Symbol keys.
   const _wpProbeId = "_xsearch_probe_" + Math.random().toString(36).slice(2);
   const wp = () => {
     if (_wpRequire) return _wpRequire;
@@ -147,9 +126,7 @@
     return _wpRequire;
   };
 
-  // Extract all possible export surfaces from a webpack module.
-  // Checks the top level, the default export, and all object valued
-  // keys so renamed or restructured modules still surface.
+  // Extract all possible export surfaces from a webpack module: top-level, default export, and keyed sub-objects.
   const candidatesOf = (mod) => {
     if (!mod?.exports) return [];
     const seen = new Set();
@@ -170,12 +147,8 @@
     return out;
   };
 
-  // Discord's i18n system uses Proxy objects where every property access
-  // returns a locale message getter function. These proxies match filters
-  // for transitionTo, getToken, getGuilds, etc. because they respond to
-  // ANY property name with a function. Detect them by probing a property
-  // that could never exist on a real module: if it returns a function,
-  // the object is an i18n proxy and should be skipped.
+  // Discord's i18n system wraps strings in Proxy objects where any property access returns a function.
+  // This causes false positives when scanning for module shapes. Detect them by probing an impossible key.
   const isI18nProxy = (obj) => {
     try {
       return typeof obj["__xsearch_i18n_probe__"] === "function";
@@ -184,9 +157,7 @@
     }
   };
 
-  // Build and cache a flat list of every exported object across all
-  // webpack modules, excluding i18n proxies. Cached because the module
-  // graph is static at runtime.
+  // Build and cache a flat list of all exported objects across webpack modules (i18n proxies excluded).
   const _buildCandidates = () => {
     const wpRequire = wp();
     if (!wpRequire || !wpRequire.c) return [];
@@ -202,14 +173,7 @@
   };
   const _candidates = _buildCandidates();
 
-  // ================================================================
-  // FEATURE 1: Dynamic API base URL detection
-  // ================================================================
-  // Detect the live API version instead of hardcoding v9. Priority order:
-  // 1. Already captured from a live request (most authoritative)
-  // 2. window.GLOBAL_ENV.API_ENDPOINT exposed by Discord's client build
-  // 3. Webpack module export containing an API URL string with a version
-  // 4. Hardcoded fallback
+  // Detect the live API version instead of hardcoding v9.
   const getApiBase = () => {
     if (_capturedApiVersion) return `https://discord.com/api/${_capturedApiVersion}`;
     try {
@@ -233,20 +197,14 @@
   };
   const API_BASE = getApiBase();
 
-  // TOKEN HANDLING: the token is read from Discord's own internal stores
-  // (the same way Discord itself reads it) and is ONLY ever sent to
-  // discord.com in the authorization header of search requests.
-  // It is never logged, stored externally, or transmitted anywhere else.
-  // You can verify this by searching this entire script for "token":
-  // it only appears in this function, the variable assignment below,
-  // and the fetch() call in the search loop.
+  // The token is read from Discord's own internal stores and only ever sent as the Authorization header to discord.com search endpoints. It is never logged, stored externally, or sent elsewhere. Verify by searching "token" in this file -- it only appears in getToken(), the variable below, and searchOneGuild().
   const jwtLike = /^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{10,}$/;
   const isTokenLike = (t) => typeof t === "string" && t.length > 30 && jwtLike.test(t);
 
   const getToken = () => {
-    // Strategy 1: network capture (set by the fetch/XHR patch above; most resilient)
+    // 1. network capture from the patched fetch/XHR above
     if (_capturedToken) return _capturedToken;
-    // Strategy 2: read from Discord's own webpack auth store (kept in memory)
+    // 2. Discord's webpack auth store (holds the token in memory for the session)
     for (const exp of _candidates) {
       try {
         if (typeof exp.getToken !== "function") continue;
@@ -254,7 +212,7 @@
         if (isTokenLike(t)) return t;
       } catch (e) {}
     }
-    // Strategy 3: read from localStorage (older builds stored it here)
+    // 3. localStorage (older Discord builds stored it here)
     try {
       const raw = localStorage.getItem("token");
       if (raw) {
@@ -262,13 +220,7 @@
         if (isTokenLike(cleaned)) return cleaned;
       }
     } catch (e) {}
-    // Strategy 4 (FEATURE 3): schema-based structural scan
-    // Call every zero-argument function on modules that look like store modules
-    // (2 to 30 methods, to avoid large dispatch modules with side effects).
-    // Restrict to functions declaring zero formal parameters AND whose name is
-    // either getter-shaped (get/is/has/fetch prefix) or single-letter (likely
-    // minified) to minimize the chance of triggering side-effectful dispatchers.
-    // A JWT-shaped return value is highly distinctive, so false positives are rare.
+    // 4. Structural scan: call zero-arg getter-shaped functions and check for a JWT-shaped return value.
     const safeFnNameRe = /^(?:get|is|has|fetch|read|peek)|^[a-zA-Z]$/;
     for (const exp of _candidates) {
       try {
@@ -287,9 +239,7 @@
     return null;
   };
 
-  // Guilds: validates that the returned value is a map of guild-shaped objects
-  // using guild-specific fields (features, roles, ownerId) so other id/name maps
-  // from unrelated modules are not mistaken for guild data.
+  // Guild shape validator - requires guild-specific fields to avoid matching unrelated id/name maps.
   const looksLikeGuild = (v) =>
     v && typeof v.id === "string" && typeof v.name === "string"
     && (Array.isArray(v.features) || Array.isArray(v.roles) || v.ownerId != null);
@@ -307,7 +257,7 @@
       .map(v => ({ id: v.id, name: v.name }));
 
   const getGuilds = () => {
-    // Strategy 1: name-based (fast path)
+    // 1. name-based fast path
     for (const exp of _candidates) {
       try {
         if (typeof exp.getGuilds !== "function") continue;
@@ -315,11 +265,7 @@
         if (isGuildMap(g)) return extractGuildList(g);
       } catch (e) {}
     }
-    // Strategy 2 (FEATURE 3): schema-based structural scan
-    // Only consider zero-argument functions whose name is getter-shaped or
-    // single-letter (likely minified). This avoids invoking action creators
-    // like leaveGuild, deleteGuild, joinGuild which take args but might also
-    // exist on the same module surface.
+    // 2. Structural scan: same zero-arg getter filter used in getToken.
     const safeFnNameRe = /^(?:get|is|has|fetch|read|peek)|^[a-zA-Z]$/;
     for (const exp of _candidates) {
       try {
@@ -335,7 +281,7 @@
     return [];
   };
 
-  // Generic module finder for navigation lookups
+  // Generic module finder used for navigation lookups below.
   const findModule = (filter) => {
     for (const exp of _candidates) {
       try { if (filter(exp)) return exp; } catch (e) {}
@@ -343,20 +289,13 @@
     return null;
   };
 
-  // Navigation: three fallback strategies so renames of any single
-  // internal module do not break message jumping.
-  // Strategy 1: transitionTo (Router module, most common)
-  // Strategy 2: selectChannel (ChannelActions module)
-  // Strategy 3: history.pushState + popstate (no webpack module needed)
+  // Navigation: tries transitionTo, then selectChannel, then FluxDispatcher, then history.pushState.
   const getTransitionTo = () => {
-    // Strategy 1: name-based with paired method verification
     const mod =
       findModule(m => typeof m.transitionTo === "function" && typeof m.replaceWith === "function")
       ?? findModule(m => typeof m.transitionTo === "function");
     if (mod) return mod.transitionTo.bind(mod);
-    // Strategy 2 (FEATURE 3): schema-based router detection
-    // React Router exposes a history object with push/replace and a location
-    // with pathname. This shape is distinctive enough to match without names.
+    // Schema-based: React Router exposes a history object with push/replace/location.
     const routerMod = findModule(m =>
       m?.history && typeof m.history.push === "function"
       && typeof m.history.replace === "function"
@@ -367,14 +306,11 @@
   };
 
   const getSelectChannel = () => {
-    // Strategy 1: name-based with paired method verification
     const mod =
       findModule(m => typeof m.selectChannel === "function" && typeof m.selectVoiceChannel === "function")
       ?? findModule(m => typeof m.selectChannel === "function");
     if (mod) return mod.selectChannel.bind(mod);
-    // Strategy 2 (FEATURE 3): find a channel-actions module by characteristic
-    // sibling methods (selectVoiceChannel, selectPrivateChannel) even when
-    // selectChannel itself has been renamed by minification.
+    // Schema-based: match on sibling methods (selectVoiceChannel, selectPrivateChannel) in case selectChannel was renamed.
     const chanMod = findModule(m =>
       typeof m.selectVoiceChannel === "function" || typeof m.selectPrivateChannel === "function"
     );
@@ -385,9 +321,7 @@
     return null;
   };
 
-  // Discord-native dispatcher fallback. Discord's internal navigation is
-  // ultimately driven by Flux actions, so dispatching CHANNEL_SELECT directly
-  // works even when both Router and ChannelActions modules have been renamed.
+  // Flux dispatcher is the last webpack-based fallback; CHANNEL_SELECT drives navigation internally.
   const getFluxDispatcher = () =>
     findModule(m =>
       typeof m.dispatch === "function"
@@ -411,18 +345,14 @@
         return;
       }
     } catch (e) {}
-    // Last-resort fallback: history manipulation. Discord may not pick this up
-    // if its router does not listen on popstate, but it costs nothing to try.
+    // Last-resort: push state directly. Discord may not react if its router isn't listening on popstate.
     try {
       window.history.pushState({}, "", path);
       window.dispatchEvent(new PopStateEvent("popstate"));
     } catch (e) { console.error("[xsearch] no navigation method worked", e); }
   };
 
-  // Init
-  // Token is stored in a local variable scoped to this IIFE. It never
-  // leaves this closure and is only used in the authorization header
-  // of fetch() calls to discord.com (see the search function below).
+  // Token is scoped to this IIFE and only ever sent as the Authorization header to discord.com search endpoints.
   let token = getToken();
 
   const guilds = getGuilds().sort((a, b) => a.name.localeCompare(b.name));
@@ -430,12 +360,7 @@
   if (!token) console.warn("[xsearch] Token not found via webpack; will retry at search time via network capture.");
   console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel || fluxDispatcher)}, api=${API_BASE}, stealthHeaders=${Object.keys(_capturedHeaders).length}`);
 
-  // ================================================================
-  // FEATURE 5: CSP-resilient style injection
-  // ================================================================
-  // Use Constructable CSSStyleSheet (programmatically created, not subject
-  // to style-src unsafe-inline restrictions) with a <style> element fallback
-  // for older browsers. Calling _removeStyles() cleans up on close.
+  // Injected via CSSStyleSheet (avoids style-src unsafe-inline CSP restrictions); falls back to a <style> element.
   const CSS_TEXT = `
     #xsearch-overlay { position: fixed; top: 50px; right: 50px; width: 760px; max-width: 90vw; background: #2b2d31; color: #dbdee1; border: 1px solid #1e1f22; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 99999; font-family: system-ui, sans-serif; display: flex; flex-direction: column; }
     #xsearch-overlay.expanded { height: 750px; max-height: 88vh; }
@@ -542,8 +467,7 @@
   _removeStyles = injectStyles(CSS_TEXT);
   document.body.appendChild(overlay);
 
-  // Restore previous overlay position from a prior session, clamped to the
-  // current viewport so a smaller window cannot orphan the panel offscreen.
+  // Restore previous overlay position, clamped to viewport bounds to prevent orphaning.
   const POS_KEY = "xsearch_pos_v1";
   try {
     const saved = JSON.parse(localStorage.getItem(POS_KEY) || "null");
@@ -562,10 +486,8 @@
     } catch (e) {}
   };
 
-  // Global keyboard handler for ESC to close. Stored so we can detach on close.
   const onKeyDown = (e) => {
     if (e.key === "Escape" && document.body.contains(overlay)) {
-      // Only close if focus is in the overlay or nothing else is using ESC.
       if (overlay.contains(document.activeElement) || document.activeElement === document.body) {
         closeOverlay();
       }
@@ -648,38 +570,27 @@
   let currentQuery = "";
   let lastResults = [];
   let stopRequested = false;
-  // Hard kill: set when Discord returns 401 (token revoked) or signals an
-  // account-flag condition. When true, every in-flight server worker must
-  // exit immediately and the user must re-inject the script.
+  // hardKill is set on 401 or 403/40002; all workers exit immediately and the script must be re-injected.
   let hardKill = false;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  // Jittered sleep: humans do not click at constant intervals. ±25% noise
-  // around the target makes our timing distribution look organic without
-  // changing the average request rate.
+  // Jitter makes request timing look organic; ±25% is small enough to not materially change throughput.
   const jitter = (ms, pct = 0.25) => {
     const variance = ms * pct;
     return Math.max(0, ms + (Math.random() * 2 - 1) * variance);
   };
   const jitteredSleep = (ms, pct) => sleep(jitter(ms, pct));
 
-  // Conservative defaults that stay well under Discord's per-guild search
-  // bucket (roughly 10/5s historically). With a 2.5s mean per page we burst
-  // ~2 pages then naturally pace with the bucket. Server delay is the
-  // think-pause between switching servers within the same worker thread.
+  // 2.5s mean per page stays well under Discord's per-guild search bucket (roughly 10 req/5s historically).
   const PAGE_DELAY = 2500;
   const SERVER_DELAY = 4000;
   const PAGE_SIZE = 25;
   const INDEX_WAIT = 5000;
   const MAX_INDEX_RETRIES = 12;
-  // Maximum back-to-back 429s from a single guild before we give up on it.
-  // Three in a row indicates a behavior-flag rate limit (much longer than
-  // the bucket reset), not a normal bucket exhaustion.
+  // 3 consecutive 429s on the same guild usually indicates a behavior-flag rate limit, not a normal bucket reset.
   const MAX_CONSECUTIVE_429 = 3;
 
-  // Highlight matched query terms in result content. Splits on case-insensitive
-  // matches and rebuilds the node tree with <mark>-style spans so the user can
-  // see WHY each result matched without scanning long messages.
+  // Highlights matching query terms in result content so the user can see why each result matched.
   const highlightInto = (parent, text, query) => {
     parent.textContent = "";
     if (!text) { parent.textContent = "(no text content)"; return; }
@@ -720,15 +631,10 @@
     results.appendChild(div);
   };
 
-  // Discord caps the search 'offset' parameter at 5000. Beyond that we must
-  // switch to snowflake cursor pagination via 'max_id' (results older than
-  // the given message id) and reset offset to 0.
+  // Discord caps the search 'offset' parameter at 5000; above that we switch to max_id cursor pagination.
   const OFFSET_CAP = 5000;
 
-  // Per-guild rate limit tracker. Each guild has its own search bucket on
-  // Discord's side; we track its known reset window to skip pacing delays
-  // when we have plenty of quota left, and add them back when we are close
-  // to the limit. This is what gives us speed safely.
+  // Per-guild rate limit bucket state; keyed by guildId.
   const _bucketState = new Map(); // guildId -> { remaining, resetAt }
 
   const updateBucket = (guildId, res) => {
@@ -743,10 +649,7 @@
     } catch (e) {}
   };
 
-  // Compute how long we should sleep before the next request to this guild.
-  // - If bucket has plenty of headroom (>= 3 calls remaining), tiny jittered pause
-  // - If bucket is near-empty (1-2 calls), full PAGE_DELAY
-  // - If bucket is exhausted (0), wait for reset + small buffer
+  // Pacing tiers: skip delay if bucket has headroom, wait for reset if exhausted.
   const computePacing = (guildId) => {
     const b = _bucketState.get(guildId);
     if (!b) return jitter(PAGE_DELAY);
@@ -756,27 +659,23 @@
     return jitter(800, 0.4); // headroom: short, varied micro-pause
   };
 
-  // Cloudflare/edge sometimes returns an HTML challenge or block page with a
-  // 200 or 403 status. Detect by content-type so we do not crash JSON.parse.
+  // Detect non-JSON responses (e.g., Cloudflare HTML blocks) to avoid crashing JSON.parse.
   const isJsonResponse = (res) => {
     const ct = res.headers.get("content-type") || "";
     return ct.includes("application/json");
   };
 
-  // Build the headers for a single search request. Replays any stealth
-  // headers we captured from the real client so requests are header-shape
-  // identical to Discord's UI traffic.
+  // Builds headers for search requests. Replays stealth headers captured from real Discord traffic so
+  // requests look identical to what the client sends normally.
   const buildSearchHeaders = () => {
-    const h = { Authorization: token };
+    const h = { Authorization: token }; // token is only sent to discord.com; see fetch() call in searchOneGuild
     for (const [name, value] of Object.entries(_capturedHeaders)) {
       h[name] = value;
     }
     return h;
   };
 
-  // Concurrency runner: process items with at most `concurrency` in flight.
-  // Workers pull from a shared queue so a fast server does not idle while a
-  // slow one is still going.
+  // Processes items with at most `concurrency` workers pulling from a shared queue.
   const runWithConcurrency = async (items, fn, concurrency) => {
     const queue = items.slice();
     const workerCount = Math.max(1, Math.min(concurrency, queue.length));
@@ -852,16 +751,13 @@
             }
           } catch (e) {}
 
-          // A global rate limit means we should pause ALL servers, not just this one.
-          // We do this by setting a shared sleep barrier; here we just sleep extra long.
+          // global=true means Discord is rate-limiting the account globally, not just this guild bucket.
           if (isGlobal) {
             console.warn(`[xsearch] GLOBAL rate limit hit, pausing ${Math.ceil(retryMs / 1000)}s`);
             retryMs = Math.max(retryMs, 30000);
           }
 
-          // Back off exponentially on consecutive 429s for the same guild.
-          // Three in a row means we are likely behavior-flagged; back off hard
-          // then give up on this guild for the run.
+          // Exponential backoff per consecutive 429 on the same guild; skip after MAX_CONSECUTIVE_429.
           if (consecutive429 >= MAX_CONSECUTIVE_429) {
             console.warn(`[xsearch] ${g.name} hit ${consecutive429} consecutive 429s, skipping`);
             await sleep(retryMs * 2);
@@ -947,8 +843,7 @@
           newResults: found.length,
         });
 
-        // Pagination: prefer offset within a bucket; flip to max_id cursor
-        // once we approach Discord's hard 5000 offset cap.
+        // Switch from offset to max_id cursor pagination as we approach Discord's 5000 offset hard cap.
         if (!maxIdCursor) {
           offset += PAGE_SIZE;
           if (groups.length < PAGE_SIZE) return found;
@@ -968,7 +863,6 @@
         }
         serverPage++;
 
-        // Adaptive pacing: pull the wait time from the live bucket state.
         await sleep(computePacing(g.id));
       } catch (e) {
         console.error(`[xsearch] ${g.name}`, e);
@@ -978,7 +872,7 @@
   };
 
   const search = async (query) => {
-    // Re-check token here; it may have been captured from the network after init
+    // Re-check token - it may have arrived via network capture after initial load.
     if (!token) token = getToken();
 
     const checked = [...serversDiv.querySelectorAll("input:checked")].map(i => ({
@@ -1046,7 +940,7 @@
       if (stopRequested || hardKill) return;
       serverProgress.set(g.id, 0);
       renderStatus(`starting ${g.name}`);
-      // Small randomized stagger so we never start parallel workers in lockstep
+      // Small stagger so parallel workers don't fire in lockstep.
       await sleep(jitter(300, 0.7));
 
       const found = await searchOneGuild(g, query, (evt) => {
@@ -1072,7 +966,7 @@
       if (!stopRequested && !hardKill) await jitteredSleep(SERVER_DELAY);
     }, concurrency);
 
-    // Deduplicate by message id (cursor + offset modes can occasionally overlap).
+    // Dedup by message ID; cursor and offset modes can occasionally return overlapping pages.
     const seenIds = new Set();
     const deduped = [];
     for (const m of all) {
@@ -1093,8 +987,7 @@
     goBtn.disabled = false;
     stopBtn.disabled = true;
 
-    // Render in chunks via requestAnimationFrame so 5000+ results do not lock
-    // the UI thread for seconds. Each frame renders up to 50 results.
+    // Render in batches via requestAnimationFrame to avoid locking the UI thread on large result sets.
     let i = 0;
     const renderChunk = () => {
       const end = Math.min(deduped.length, i + 50);
