@@ -47,8 +47,23 @@
     return out;
   };
 
+  // Discord's i18n system uses Proxy objects where every property access
+  // returns a locale message getter function. These proxies match filters
+  // for transitionTo, getToken, getGuilds, etc. because they respond to
+  // ANY property name with a function. Detect them by probing a property
+  // that could never exist on a real module: if it returns a function,
+  // the object is an i18n proxy and should be skipped.
+  const isI18nProxy = (obj) => {
+    try {
+      return typeof obj["__xsearch_i18n_probe__"] === "function";
+    } catch (e) {
+      return false;
+    }
+  };
+
   // Build and cache a flat list of every exported object across all
-  // webpack modules. Cached because the module graph is static at runtime.
+  // webpack modules, excluding i18n proxies. Cached because the module
+  // graph is static at runtime.
   const _buildCandidates = () => {
     const wpRequire = wp();
     if (!wpRequire || !wpRequire.c) return [];
@@ -56,7 +71,7 @@
     for (const id in wpRequire.c) {
       try {
         for (const exp of candidatesOf(wpRequire.c[id])) {
-          out.push(exp);
+          if (!isI18nProxy(exp)) out.push(exp);
         }
       } catch (e) {}
     }
@@ -64,7 +79,7 @@
   };
   const _candidates = _buildCandidates();
 
-  // TOKEN HANDLING: the token is read from Discord's own internal stores P.S. haha line 67 funny
+  // TOKEN HANDLING: the token is read from Discord's own internal stores
   // (the same way Discord itself reads it) and is ONLY ever sent to
   // discord.com in the authorization header of search requests.
   // It is never logged, stored externally, or transmitted anywhere else.
@@ -309,6 +324,8 @@
   const PAGE_DELAY = 2000;
   const SERVER_DELAY = 4000;
   const PAGE_SIZE = 25;
+  const INDEX_WAIT = 5000;
+  const MAX_INDEX_RETRIES = 12; // 12 x 5s = 60s max wait for indexing
 
   const renderResult = (m) => {
     const results = overlay.querySelector("#xsearch-results");
@@ -348,8 +365,17 @@
 
     const all = [];
     const total = checked.length;
-    let totalRequests = 0;
-    let completedRequests = 0;
+
+    // Progress model: each server gets an equal 1/total slice of the bar.
+    // Pages within a server subdivide that slice. A 0 result server
+    // completes its full slice immediately. The bar only moves forward
+    // because a server with many pages just fills its own slice more
+    // slowly; it never reduces progress already shown.
+    let completedServers = 0;
+    const updateProgress = (serverFraction) => {
+      const pct = ((completedServers + Math.min(1, serverFraction)) / total) * 100;
+      progressBar.style.width = `${Math.min(100, pct)}%`;
+    };
 
     outer:
     for (let s = 0; s < total; s++) {
@@ -357,6 +383,10 @@
       let offset = 0;
       let serverTotal = null;
       let serverPage = 1;
+      let serverPages = 1;
+      let indexRetries = 0;
+
+      updateProgress(0);
 
       while (true) {
         if (stopRequested) break outer;
@@ -370,6 +400,7 @@
           // This is the ONLY place the token is used after retrieval
           const url = `https://discord.com/api/v9/guilds/${g.id}/messages/search?content=${encodeURIComponent(query)}&offset=${offset}`;
           const res = await fetch(url, { headers: { authorization: token } }); // token sent to discord.com only
+
           if (res.status === 429) {
             for (let countdown = 20; countdown > 0; countdown--) {
               if (stopRequested) break outer;
@@ -378,14 +409,53 @@
             }
             continue;
           }
+
+          // Handle 202: Discord returns this when the server is still
+          // being indexed and search results are not yet available
+          if (res.status === 202) {
+            indexRetries++;
+            if (indexRetries > MAX_INDEX_RETRIES) {
+              console.warn(`[xsearch] ${g.name} still indexing after ${MAX_INDEX_RETRIES} retries, skipping`);
+              status.textContent = `${g.name} is still indexing, skipping... (${all.length} results so far)`;
+              break;
+            }
+            status.textContent = `${g.name} is being indexed by Discord, waiting... (attempt ${indexRetries}/${MAX_INDEX_RETRIES})`;
+            await sleep(INDEX_WAIT);
+            continue;
+          }
+
           if (!res.ok) {
             console.warn(`[xsearch] ${g.name} returned ${res.status}`);
             break;
           }
+
           const data = await res.json();
+
+          // Some Discord versions return 200 with an indexing flag in the
+          // body instead of a 202 status. Detect this by checking for the
+          // flag or for a suspiciously empty first page with an analytics_id
+          // (which indicates the server acknowledged the query but has no
+          // index to search yet).
+          const bodyIndicatesIndexing = data.indexing
+            || (offset === 0 && data.total_results === 0 && data.analytics_id && !(data.messages?.length));
+          if (bodyIndicatesIndexing) {
+            indexRetries++;
+            if (indexRetries > MAX_INDEX_RETRIES) {
+              console.warn(`[xsearch] ${g.name} still indexing after ${MAX_INDEX_RETRIES} retries, skipping`);
+              status.textContent = `${g.name} is still indexing, skipping... (${all.length} results so far)`;
+              break;
+            }
+            status.textContent = `${g.name} is being indexed by Discord, waiting... (attempt ${indexRetries}/${MAX_INDEX_RETRIES})`;
+            await sleep(INDEX_WAIT);
+            continue;
+          }
+
+          // Reset indexing counter on a successful real response
+          indexRetries = 0;
+
           if (serverTotal == null) {
             serverTotal = data.total_results || 0;
-            totalRequests = completedRequests + Math.max(1, Math.ceil(serverTotal / PAGE_SIZE)) + (total - s - 1);
+            serverPages = Math.max(1, Math.ceil(serverTotal / PAGE_SIZE));
           }
           const groups = data.messages || [];
           if (groups.length === 0) break;
@@ -398,8 +468,7 @@
             }
           }
 
-          completedRequests++;
-          progressBar.style.width = `${Math.min(100, (completedRequests / Math.max(1, totalRequests)) * 100)}%`;
+          updateProgress(serverPage / serverPages);
 
           offset += PAGE_SIZE;
           if (offset >= serverTotal || groups.length < PAGE_SIZE) break;
@@ -411,6 +480,11 @@
           break;
         }
       }
+
+      // Server finished (0 results, all pages done, error, or skip).
+      // Advance the bar by completing this server's full slice.
+      completedServers++;
+      updateProgress(0);
 
       if (s < total - 1 && !stopRequested) {
         status.textContent = `Waiting before next server... (${all.length} results so far)`;
