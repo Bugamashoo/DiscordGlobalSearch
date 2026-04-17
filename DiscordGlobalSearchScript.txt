@@ -8,12 +8,50 @@
   // the originals. Restores itself once both values are captured.
   let _capturedToken = null;
   let _capturedApiVersion = null;
+  // Stealth headers captured from the real client: we replay these exact values
+  // so our search requests are header-by-header indistinguishable from Discord's
+  // own UI. Without these, requests look automation-shaped (no super-properties,
+  // no locale/timezone) which is one of the easier patterns to flag.
+  const _capturedHeaders = {};
+  // Header allowlist: only the metadata-shaped headers Discord sends from the
+  // client. We deliberately exclude content-length, content-type, cookie (the
+  // browser handles cookie automatically with credentials:include), referer,
+  // user-agent (the browser sets it), and any cache-control.
+  const _stealthHeaderAllow = new Set([
+    "x-super-properties",
+    "x-discord-locale",
+    "x-discord-timezone",
+    "x-debug-options",
+    "x-discord-react-locale",
+  ]);
   const _origFetch = window.fetch;
   const _origXHROpen = XMLHttpRequest.prototype.open;
   const _origXHRSetHeader = XMLHttpRequest.prototype.setRequestHeader;
   const _xhrUrls = new WeakMap();
 
-  const _netCapture = (urlStr, authHeader) => {
+  const _restoreNet = () => {
+    window.fetch = _origFetch;
+    XMLHttpRequest.prototype.open = _origXHROpen;
+    XMLHttpRequest.prototype.setRequestHeader = _origXHRSetHeader;
+  };
+
+  const _maybeRestore = () => {
+    // Stop intercepting once we have token + version + at least one stealth
+    // header. Keeps the patch surface tiny so we do not accidentally affect
+    // Discord's own performance.
+    if (_capturedToken && _capturedApiVersion && Object.keys(_capturedHeaders).length > 0) {
+      _restoreNet();
+    }
+  };
+
+  const _saveHeader = (name, value) => {
+    if (!name || value == null) return;
+    const lower = String(name).toLowerCase();
+    if (!_stealthHeaderAllow.has(lower)) return;
+    if (!_capturedHeaders[lower]) _capturedHeaders[lower] = String(value);
+  };
+
+  const _netCapture = (urlStr, authHeader, headerEntries) => {
     if (!urlStr || !urlStr.includes("discord.com/api/")) return;
     if (!_capturedApiVersion) {
       const m = urlStr.match(/discord(?:app)?\.com\/api\/(v\d+)\//);
@@ -25,20 +63,30 @@
       // currently accepts on the search endpoint (the raw header value).
       _capturedToken = authHeader.replace(/^Bearer\s+/i, "");
     }
-    if (_capturedToken && _capturedApiVersion) {
-      window.fetch = _origFetch;
-      XMLHttpRequest.prototype.open = _origXHROpen;
-      XMLHttpRequest.prototype.setRequestHeader = _origXHRSetHeader;
+    if (headerEntries) {
+      for (const [name, value] of headerEntries) _saveHeader(name, value);
     }
+    _maybeRestore();
+  };
+
+  const _entriesFromInit = (init) => {
+    if (!init?.headers) return null;
+    if (init.headers instanceof Headers) return [...init.headers.entries()];
+    if (Array.isArray(init.headers)) return init.headers;
+    return Object.entries(init.headers);
   };
 
   window.fetch = function(url, init) {
     try {
       const urlStr = String(typeof url === "string" ? url : (url?.url ?? url));
+      const entries = _entriesFromInit(init);
       let auth;
-      if (init?.headers instanceof Headers) auth = init.headers.get("authorization");
-      else if (init?.headers) auth = init.headers["authorization"] ?? init.headers["Authorization"];
-      _netCapture(urlStr, auth);
+      if (entries) {
+        for (const [n, v] of entries) {
+          if (String(n).toLowerCase() === "authorization") { auth = v; break; }
+        }
+      }
+      _netCapture(urlStr, auth, entries);
     } catch (e) {}
     return _origFetch.apply(this, arguments);
   };
@@ -50,8 +98,13 @@
 
   XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
     try {
-      if (name.toLowerCase() === "authorization")
-        _netCapture(_xhrUrls.get(this) ?? "", value);
+      const url = _xhrUrls.get(this) ?? "";
+      if (String(name).toLowerCase() === "authorization") {
+        _netCapture(url, value, null);
+      } else if (url.includes("discord.com/api/")) {
+        _saveHeader(name, value);
+        _maybeRestore();
+      }
     } catch (e) {}
     return _origXHRSetHeader.apply(this, arguments);
   };
@@ -375,7 +428,7 @@
   const guilds = getGuilds().sort((a, b) => a.name.localeCompare(b.name));
   if (guilds.length === 0) { console.error("[xsearch] Found 0 guilds."); return; }
   if (!token) console.warn("[xsearch] Token not found via webpack; will retry at search time via network capture.");
-  console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel)}, api=${API_BASE}`);
+  console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel || fluxDispatcher)}, api=${API_BASE}, stealthHeaders=${Object.keys(_capturedHeaders).length}`);
 
   // ================================================================
   // FEATURE 5: CSP-resilient style injection
@@ -396,7 +449,10 @@
     #xsearch-body { padding: 14px; overflow-y: auto; flex: 1; }
     #xsearch-overlay:not(.expanded) #xsearch-body { display: none; }
     #xsearch-overlay input[type=text] { width: 100%; padding: 9px 12px; background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
-    #xsearch-controls { display: flex; gap: 8px; margin-top: 8px; }
+    #xsearch-controls { display: flex; gap: 8px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+    #xsearch-overlay .ctl-group { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #b5bac1; margin-left: auto; }
+    #xsearch-overlay .ctl-group select { background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; font-size: 12px; }
+    #xsearch-overlay .hl { background: #5865f2; color: #fff; padding: 0 2px; border-radius: 2px; }
     #xsearch-overlay button.act { padding: 8px 14px; background: #5865f2; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
     #xsearch-overlay button.act.alt { background: #3ba55d; }
     #xsearch-overlay button.act.ghost { background: #4e5058; }
@@ -456,6 +512,16 @@
         <button class="act" id="xsearch-go">Search all pages</button>
         <button class="act ghost" id="xsearch-stop" disabled>Stop</button>
         <button class="act alt" id="xsearch-export" disabled>Export CSV</button>
+        <span class="ctl-group">
+          <label for="xsearch-concurrency" title="How many servers to search at once. Each server has its own rate-limit bucket on Discord's side, so 2-3 is faster without raising your per-bucket request rate.">Parallel</label>
+          <select id="xsearch-concurrency">
+            <option value="1">1 (slowest, safest)</option>
+            <option value="2" selected>2 (recommended)</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+            <option value="5">5 (fastest)</option>
+          </select>
+        </span>
       </div>
       <div id="xsearch-servers-wrap">
         <div id="xsearch-servers-head">
@@ -476,6 +542,44 @@
   _removeStyles = injectStyles(CSS_TEXT);
   document.body.appendChild(overlay);
 
+  // Restore previous overlay position from a prior session, clamped to the
+  // current viewport so a smaller window cannot orphan the panel offscreen.
+  const POS_KEY = "xsearch_pos_v1";
+  try {
+    const saved = JSON.parse(localStorage.getItem(POS_KEY) || "null");
+    if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+      const maxLeft = Math.max(0, window.innerWidth - 200);
+      const maxTop = Math.max(0, window.innerHeight - 100);
+      overlay.style.left = Math.min(maxLeft, Math.max(0, saved.left)) + "px";
+      overlay.style.top = Math.min(maxTop, Math.max(0, saved.top)) + "px";
+      overlay.style.right = "auto";
+    }
+  } catch (e) {}
+  const savePos = () => {
+    try {
+      const r = overlay.getBoundingClientRect();
+      localStorage.setItem(POS_KEY, JSON.stringify({ left: r.left, top: r.top }));
+    } catch (e) {}
+  };
+
+  // Global keyboard handler for ESC to close. Stored so we can detach on close.
+  const onKeyDown = (e) => {
+    if (e.key === "Escape" && document.body.contains(overlay)) {
+      // Only close if focus is in the overlay or nothing else is using ESC.
+      if (overlay.contains(document.activeElement) || document.activeElement === document.body) {
+        closeOverlay();
+      }
+    }
+  };
+  document.addEventListener("keydown", onKeyDown);
+
+  const closeOverlay = () => {
+    stopRequested = true;
+    document.removeEventListener("keydown", onKeyDown);
+    _removeStyles?.();
+    overlay.remove();
+  };
+
   // Drag handling
   const header = overlay.querySelector("#xsearch-header");
   let dragging = false, dx = 0, dy = 0, dragMoved = false;
@@ -495,7 +599,10 @@
     overlay.style.top = (e.clientY - dy) + "px";
     overlay.style.right = "auto";
   });
-  document.addEventListener("mouseup", () => dragging = false);
+  document.addEventListener("mouseup", () => {
+    if (dragging && dragMoved) savePos();
+    dragging = false;
+  });
 
   header.addEventListener("click", e => {
     if (e.target.tagName === "BUTTON") return;
@@ -511,8 +618,7 @@
   };
   overlay.querySelector("#xsearch-close").onclick = (e) => {
     e.stopPropagation();
-    _removeStyles?.();
-    overlay.remove();
+    closeOverlay();
   };
 
   const escapeHtml = (s) => String(s ?? "")
@@ -542,13 +648,60 @@
   let currentQuery = "";
   let lastResults = [];
   let stopRequested = false;
+  // Hard kill: set when Discord returns 401 (token revoked) or signals an
+  // account-flag condition. When true, every in-flight server worker must
+  // exit immediately and the user must re-inject the script.
+  let hardKill = false;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const PAGE_DELAY = 2000;
+  // Jittered sleep: humans do not click at constant intervals. ±25% noise
+  // around the target makes our timing distribution look organic without
+  // changing the average request rate.
+  const jitter = (ms, pct = 0.25) => {
+    const variance = ms * pct;
+    return Math.max(0, ms + (Math.random() * 2 - 1) * variance);
+  };
+  const jitteredSleep = (ms, pct) => sleep(jitter(ms, pct));
+
+  // Conservative defaults that stay well under Discord's per-guild search
+  // bucket (roughly 10/5s historically). With a 2.5s mean per page we burst
+  // ~2 pages then naturally pace with the bucket. Server delay is the
+  // think-pause between switching servers within the same worker thread.
+  const PAGE_DELAY = 2500;
   const SERVER_DELAY = 4000;
   const PAGE_SIZE = 25;
   const INDEX_WAIT = 5000;
-  const MAX_INDEX_RETRIES = 12; // 12 x 5s = 60s max wait for indexing
+  const MAX_INDEX_RETRIES = 12;
+  // Maximum back-to-back 429s from a single guild before we give up on it.
+  // Three in a row indicates a behavior-flag rate limit (much longer than
+  // the bucket reset), not a normal bucket exhaustion.
+  const MAX_CONSECUTIVE_429 = 3;
+
+  // Highlight matched query terms in result content. Splits on case-insensitive
+  // matches and rebuilds the node tree with <mark>-style spans so the user can
+  // see WHY each result matched without scanning long messages.
+  const highlightInto = (parent, text, query) => {
+    parent.textContent = "";
+    if (!text) { parent.textContent = "(no text content)"; return; }
+    const terms = query.split(/\s+/).filter(t => t.length >= 2);
+    if (terms.length === 0) { parent.textContent = text; return; }
+    const escaped = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const re = new RegExp(`(${escaped.join("|")})`, "gi");
+    const parts = text.split(re);
+    for (const p of parts) {
+      if (!p) continue;
+      if (re.test(p)) {
+        re.lastIndex = 0;
+        const span = document.createElement("span");
+        span.className = "hl";
+        span.textContent = p;
+        parent.appendChild(span);
+      } else {
+        parent.appendChild(document.createTextNode(p));
+      }
+      re.lastIndex = 0;
+    }
+  };
 
   const renderResult = (m) => {
     const results = overlay.querySelector("#xsearch-results");
@@ -560,7 +713,7 @@
     meta.textContent = `${m._guildName} #${m.channel_id} ${date} ${m.author?.username || "?"}`;
     const content = document.createElement("div");
     content.className = "content";
-    content.textContent = m.content || "(no text content)";
+    highlightInto(content, m.content || "", currentQuery);
     div.appendChild(meta);
     div.appendChild(content);
     div.onclick = () => jumpToMessage(m._guildId, m.channel_id, m.id);
@@ -569,22 +722,38 @@
 
   // Discord caps the search 'offset' parameter at 5000. Beyond that we must
   // switch to snowflake cursor pagination via 'max_id' (results older than
-  // the given message id) and reset offset to 0. This unlocks unbounded
-  // pagination through very large servers.
+  // the given message id) and reset offset to 0.
   const OFFSET_CAP = 5000;
 
-  // Proactive rate-limit pacing: if Discord reports we have 0 calls left in
-  // the current bucket and gives us a reset-after time, we sleep that long
-  // BEFORE the next request to avoid even hitting a 429. Falls back to a
-  // small fixed delay between pages.
-  const respectRateLimit = async (res) => {
+  // Per-guild rate limit tracker. Each guild has its own search bucket on
+  // Discord's side; we track its known reset window to skip pacing delays
+  // when we have plenty of quota left, and add them back when we are close
+  // to the limit. This is what gives us speed safely.
+  const _bucketState = new Map(); // guildId -> { remaining, resetAt }
+
+  const updateBucket = (guildId, res) => {
     try {
       const remaining = parseInt(res.headers.get("X-RateLimit-Remaining") ?? "", 10);
       const resetAfter = parseFloat(res.headers.get("X-RateLimit-Reset-After") ?? "");
-      if (!Number.isNaN(remaining) && remaining <= 0 && !Number.isNaN(resetAfter) && resetAfter > 0) {
-        await sleep(Math.min(60_000, Math.ceil(resetAfter * 1000) + 100));
-      }
+      if (Number.isNaN(remaining) || Number.isNaN(resetAfter)) return;
+      _bucketState.set(guildId, {
+        remaining,
+        resetAt: Date.now() + resetAfter * 1000,
+      });
     } catch (e) {}
+  };
+
+  // Compute how long we should sleep before the next request to this guild.
+  // - If bucket has plenty of headroom (>= 3 calls remaining), tiny jittered pause
+  // - If bucket is near-empty (1-2 calls), full PAGE_DELAY
+  // - If bucket is exhausted (0), wait for reset + small buffer
+  const computePacing = (guildId) => {
+    const b = _bucketState.get(guildId);
+    if (!b) return jitter(PAGE_DELAY);
+    const msUntilReset = Math.max(0, b.resetAt - Date.now());
+    if (b.remaining <= 0) return msUntilReset + 250;
+    if (b.remaining <= 2) return Math.max(jitter(PAGE_DELAY), msUntilReset / Math.max(1, b.remaining));
+    return jitter(800, 0.4); // headroom: short, varied micro-pause
   };
 
   // Cloudflare/edge sometimes returns an HTML challenge or block page with a
@@ -594,9 +763,224 @@
     return ct.includes("application/json");
   };
 
+  // Build the headers for a single search request. Replays any stealth
+  // headers we captured from the real client so requests are header-shape
+  // identical to Discord's UI traffic.
+  const buildSearchHeaders = () => {
+    const h = { Authorization: token };
+    for (const [name, value] of Object.entries(_capturedHeaders)) {
+      h[name] = value;
+    }
+    return h;
+  };
+
+  // Concurrency runner: process items with at most `concurrency` in flight.
+  // Workers pull from a shared queue so a fast server does not idle while a
+  // slow one is still going.
+  const runWithConcurrency = async (items, fn, concurrency) => {
+    const queue = items.slice();
+    const workerCount = Math.max(1, Math.min(concurrency, queue.length));
+    const workers = [];
+    for (let i = 0; i < workerCount; i++) {
+      workers.push((async () => {
+        while (queue.length) {
+          if (stopRequested || hardKill) return;
+          const item = queue.shift();
+          try { await fn(item); } catch (e) { console.error("[xsearch] worker", e); }
+        }
+      })());
+    }
+    await Promise.all(workers);
+  };
+
+  const searchOneGuild = async (g, query, onPage) => {
+    let offset = 0;
+    let maxIdCursor = null;
+    let oldestIdSeenInBucket = null;
+    let serverTotal = null;
+    let serverPage = 1;
+    let serverPages = 1;
+    let indexRetries = 0;
+    let consecutive429 = 0;
+    const found = [];
+
+    while (true) {
+      if (stopRequested || hardKill) return found;
+
+      try {
+        // include_nsfw=true so age-gated channels are not silently excluded.
+        const params = new URLSearchParams({ content: query, include_nsfw: "true" });
+        if (maxIdCursor) params.set("max_id", maxIdCursor);
+        else params.set("offset", String(offset));
+        const url = `${API_BASE}/guilds/${g.id}/messages/search?${params.toString()}`;
+        const res = await fetch(url, {
+          headers: buildSearchHeaders(),
+          credentials: "include",
+        });
+
+        // Hard auth failure: token revoked or invalidated. Stop the entire run.
+        if (res.status === 401) {
+          hardKill = true;
+          console.error("[xsearch] 401 unauthorized - token rejected, halting all searches");
+          return found;
+        }
+
+        // 403 with code 40002 indicates an account-action flag; halt.
+        if (res.status === 403) {
+          let bodyCode = null;
+          try { if (isJsonResponse(res)) bodyCode = (await res.json())?.code; } catch (e) {}
+          if (bodyCode === 40002) {
+            hardKill = true;
+            console.error("[xsearch] 403 code 40002 - account action required, halting");
+            return found;
+          }
+          console.warn(`[xsearch] ${g.name} returned 403, skipping`);
+          return found;
+        }
+
+        if (res.status === 429) {
+          consecutive429++;
+          let retryMs = 20000;
+          let isGlobal = false;
+          try {
+            const headerVal = res.headers.get("Retry-After");
+            if (headerVal != null) retryMs = parseFloat(headerVal) * 1000;
+            if (isJsonResponse(res)) {
+              const body = await res.json();
+              if (typeof body.retry_after === "number") retryMs = body.retry_after * 1000;
+              if (body.global === true) isGlobal = true;
+            }
+          } catch (e) {}
+
+          // A global rate limit means we should pause ALL servers, not just this one.
+          // We do this by setting a shared sleep barrier; here we just sleep extra long.
+          if (isGlobal) {
+            console.warn(`[xsearch] GLOBAL rate limit hit, pausing ${Math.ceil(retryMs / 1000)}s`);
+            retryMs = Math.max(retryMs, 30000);
+          }
+
+          // Back off exponentially on consecutive 429s for the same guild.
+          // Three in a row means we are likely behavior-flagged; back off hard
+          // then give up on this guild for the run.
+          if (consecutive429 >= MAX_CONSECUTIVE_429) {
+            console.warn(`[xsearch] ${g.name} hit ${consecutive429} consecutive 429s, skipping`);
+            await sleep(retryMs * 2);
+            return found;
+          }
+          retryMs = Math.max(retryMs, retryMs * Math.pow(1.5, consecutive429 - 1));
+
+          const totalSecs = Math.max(1, Math.ceil(retryMs / 1000));
+          for (let remaining = totalSecs; remaining > 0; remaining--) {
+            if (stopRequested || hardKill) return found;
+            onPage?.({ kind: "ratelimit", remaining, guild: g.name });
+            await sleep(1000);
+          }
+          continue;
+        }
+        consecutive429 = 0;
+        updateBucket(g.id, res);
+
+        if (res.status === 202) {
+          indexRetries++;
+          if (indexRetries > MAX_INDEX_RETRIES) {
+            console.warn(`[xsearch] ${g.name} still indexing after ${MAX_INDEX_RETRIES} retries, skipping`);
+            return found;
+          }
+          onPage?.({ kind: "indexing", attempt: indexRetries, guild: g.name });
+          await sleep(INDEX_WAIT);
+          continue;
+        }
+
+        if (!res.ok) {
+          console.warn(`[xsearch] ${g.name} returned ${res.status}`);
+          return found;
+        }
+
+        if (!isJsonResponse(res)) {
+          console.warn(`[xsearch] ${g.name} returned non-JSON response, skipping`);
+          return found;
+        }
+
+        const data = await res.json();
+
+        const bodyIndicatesIndexing = data.indexing
+          || (offset === 0 && !maxIdCursor && data.total_results === 0
+              && data.analytics_id && !(data.messages?.length));
+        if (bodyIndicatesIndexing) {
+          indexRetries++;
+          if (indexRetries > MAX_INDEX_RETRIES) {
+            console.warn(`[xsearch] ${g.name} still indexing after ${MAX_INDEX_RETRIES} retries, skipping`);
+            return found;
+          }
+          onPage?.({ kind: "indexing", attempt: indexRetries, guild: g.name });
+          await sleep(INDEX_WAIT);
+          continue;
+        }
+
+        indexRetries = 0;
+
+        if (serverTotal == null) {
+          serverTotal = data.total_results || 0;
+          serverPages = Math.max(1, Math.ceil(serverTotal / PAGE_SIZE));
+        }
+        const groups = data.messages || [];
+        if (groups.length === 0) return found;
+
+        for (const group of groups) {
+          const hit = group.find(m => m.hit) || group[0];
+          if (hit) {
+            const enriched = { ...hit, _guildId: g.id, _guildName: g.name };
+            found.push(enriched);
+            if (!oldestIdSeenInBucket || BigInt(hit.id) < BigInt(oldestIdSeenInBucket)) {
+              oldestIdSeenInBucket = hit.id;
+            }
+          }
+        }
+
+        onPage?.({
+          kind: "page",
+          guild: g.name,
+          page: serverPage,
+          totalPages: serverPages,
+          serverTotal,
+          fraction: serverPage / serverPages,
+          newResults: found.length,
+        });
+
+        // Pagination: prefer offset within a bucket; flip to max_id cursor
+        // once we approach Discord's hard 5000 offset cap.
+        if (!maxIdCursor) {
+          offset += PAGE_SIZE;
+          if (groups.length < PAGE_SIZE) return found;
+          if (offset >= serverTotal) return found;
+          if (offset >= OFFSET_CAP) {
+            if (!oldestIdSeenInBucket) return found;
+            maxIdCursor = oldestIdSeenInBucket;
+            oldestIdSeenInBucket = null;
+            offset = 0;
+          }
+        } else {
+          if (groups.length < PAGE_SIZE) return found;
+          if (!oldestIdSeenInBucket) return found;
+          if (oldestIdSeenInBucket === maxIdCursor) return found;
+          maxIdCursor = oldestIdSeenInBucket;
+          oldestIdSeenInBucket = null;
+        }
+        serverPage++;
+
+        // Adaptive pacing: pull the wait time from the live bucket state.
+        await sleep(computePacing(g.id));
+      } catch (e) {
+        console.error(`[xsearch] ${g.name}`, e);
+        return found;
+      }
+    }
+  };
+
   const search = async (query) => {
     // Re-check token here; it may have been captured from the network after init
     if (!token) token = getToken();
+
     const checked = [...serversDiv.querySelectorAll("input:checked")].map(i => ({
       id: i.dataset.id,
       name: i.parentElement.querySelector("span").textContent.trim()
@@ -609,6 +993,8 @@
     const exportBtn = overlay.querySelector("#xsearch-export");
     const goBtn = overlay.querySelector("#xsearch-go");
     const stopBtn = overlay.querySelector("#xsearch-stop");
+    const concurrencyInput = overlay.querySelector("#xsearch-concurrency");
+    const concurrency = Math.max(1, Math.min(5, parseInt(concurrencyInput?.value ?? "2", 10) || 2));
 
     results.innerHTML = "";
     progressWrap.style.display = "block";
@@ -617,199 +1003,74 @@
     goBtn.disabled = true;
     stopBtn.disabled = false;
     stopRequested = false;
+    hardKill = false;
     lastResults = [];
 
     if (!token) {
-      status.textContent = "Error: could not retrieve auth token. Try navigating to a channel first.";
+      status.textContent = "Error: could not retrieve auth token. Open any channel in Discord then click Search again.";
       goBtn.disabled = false;
+      stopBtn.disabled = true;
+      progressWrap.style.display = "none";
       return;
     }
-    if (checked.length === 0) { alert("Select at least one server."); return; }
+    if (checked.length === 0) {
+      status.textContent = "Select at least one server.";
+      goBtn.disabled = false;
+      stopBtn.disabled = true;
+      progressWrap.style.display = "none";
+      return;
+    }
 
     const all = [];
     const total = checked.length;
-
-    // Progress model: each server gets an equal 1/total slice of the bar.
-    // Pages within a server subdivide that slice. A 0 result server
-    // completes its full slice immediately. The bar only moves forward
-    // because a server with many pages just fills its own slice more
-    // slowly; it never reduces progress already shown.
     let completedServers = 0;
-    const updateProgress = (serverFraction) => {
-      const pct = ((completedServers + Math.min(1, serverFraction)) / total) * 100;
+    const serverProgress = new Map(); // guildId -> [0..1]
+
+    const updateProgress = () => {
+      let sum = completedServers;
+      for (const f of serverProgress.values()) sum += Math.min(1, f);
+      const pct = (sum / total) * 100;
       progressBar.style.width = `${Math.min(100, pct)}%`;
     };
 
-    outer:
-    for (let s = 0; s < total; s++) {
-      const g = checked[s];
-      let offset = 0;
-      let maxIdCursor = null;          // snowflake cursor used after offset cap
-      let oldestIdSeenInBucket = null; // tracks oldest hit id during the current cursor bucket
-      let serverTotal = null;
-      let serverPage = 1;
-      let serverPages = 1;
-      let indexRetries = 0;
+    const renderStatus = (extra = "") => {
+      const inFlight = serverProgress.size;
+      status.textContent =
+        `${completedServers}/${total} servers done, ${inFlight} active, ${all.length} results` +
+        (extra ? ` - ${extra}` : "");
+    };
 
-      updateProgress(0);
+    renderStatus();
 
-      while (true) {
-        if (stopRequested) break outer;
-        const pageInfo = serverTotal != null
-          ? `page ${serverPage} of ~${Math.ceil(serverTotal / PAGE_SIZE)}`
-          : `page ${serverPage}`;
-        status.textContent = `Server ${s + 1}/${total}: ${g.name} - ${pageInfo} (${all.length} results so far)`;
+    await runWithConcurrency(checked, async (g) => {
+      if (stopRequested || hardKill) return;
+      serverProgress.set(g.id, 0);
+      renderStatus(`starting ${g.name}`);
+      // Small randomized stagger so we never start parallel workers in lockstep
+      await sleep(jitter(300, 0.7));
 
-        try {
-          // NETWORK REQUEST: search sent to discord.com only (never any third party)
-          // This is the ONLY place the token is used after retrieval.
-          // include_nsfw=true so age-gated channels are not silently excluded.
-          const params = new URLSearchParams({ content: query, include_nsfw: "true" });
-          if (maxIdCursor) params.set("max_id", maxIdCursor);
-          else params.set("offset", String(offset));
-          const url = `${API_BASE}/guilds/${g.id}/messages/search?${params.toString()}`;
-          const res = await fetch(url, {
-            // Canonical "Authorization" casing; some edge proxies are picky.
-            headers: { Authorization: token },
-            credentials: "include"
-          });
-
-          // ================================================================
-          // FEATURE 2: Parse Retry-After header/body instead of hardcoding 20s
-          // ================================================================
-          if (res.status === 429) {
-            let retryMs = 20000;
-            try {
-              const headerVal = res.headers.get("Retry-After");
-              if (headerVal != null) {
-                retryMs = parseFloat(headerVal) * 1000;
-              } else if (isJsonResponse(res)) {
-                const body = await res.json();
-                if (typeof body.retry_after === "number") retryMs = body.retry_after * 1000;
-              }
-            } catch (e) {}
-            const totalSecs = Math.max(1, Math.ceil(retryMs / 1000));
-            for (let remaining = totalSecs; remaining > 0; remaining--) {
-              if (stopRequested) break outer;
-              status.textContent = `Rate limited (429) on ${g.name} page ${serverPage} - retrying in ${remaining}s...`;
-              await sleep(1000);
-            }
-            continue;
-          }
-
-          // Handle 202: Discord returns this when the server is still
-          // being indexed and search results are not yet available
-          if (res.status === 202) {
-            indexRetries++;
-            if (indexRetries > MAX_INDEX_RETRIES) {
-              console.warn(`[xsearch] ${g.name} still indexing after ${MAX_INDEX_RETRIES} retries, skipping`);
-              status.textContent = `${g.name} is still indexing, skipping... (${all.length} results so far)`;
-              break;
-            }
-            status.textContent = `${g.name} is being indexed by Discord, waiting... (attempt ${indexRetries}/${MAX_INDEX_RETRIES})`;
-            await sleep(INDEX_WAIT);
-            continue;
-          }
-
-          if (!res.ok) {
-            console.warn(`[xsearch] ${g.name} returned ${res.status}`);
-            break;
-          }
-
-          // Cloudflare or proxy returning HTML on a "successful" status: bail
-          // for this server rather than crashing the whole run with a parse error.
-          if (!isJsonResponse(res)) {
-            console.warn(`[xsearch] ${g.name} returned non-JSON response, skipping`);
-            break;
-          }
-
-          const data = await res.json();
-
-          // Some Discord versions return 200 with an indexing flag in the
-          // body instead of a 202 status. Detect this by checking for the
-          // flag or for a suspiciously empty first page with an analytics_id
-          // (which indicates the server acknowledged the query but has no
-          // index to search yet).
-          const bodyIndicatesIndexing = data.indexing
-            || (offset === 0 && !maxIdCursor && data.total_results === 0 && data.analytics_id && !(data.messages?.length));
-          if (bodyIndicatesIndexing) {
-            indexRetries++;
-            if (indexRetries > MAX_INDEX_RETRIES) {
-              console.warn(`[xsearch] ${g.name} still indexing after ${MAX_INDEX_RETRIES} retries, skipping`);
-              status.textContent = `${g.name} is still indexing, skipping... (${all.length} results so far)`;
-              break;
-            }
-            status.textContent = `${g.name} is being indexed by Discord, waiting... (attempt ${indexRetries}/${MAX_INDEX_RETRIES})`;
-            await sleep(INDEX_WAIT);
-            continue;
-          }
-
-          indexRetries = 0;
-
-          if (serverTotal == null) {
-            serverTotal = data.total_results || 0;
-            serverPages = Math.max(1, Math.ceil(serverTotal / PAGE_SIZE));
-          }
-          const groups = data.messages || [];
-          if (groups.length === 0) break;
-
-          for (const group of groups) {
-            const hit = group.find(m => m.hit) || group[0];
-            if (hit) {
-              const enriched = { ...hit, _guildId: g.id, _guildName: g.name };
-              all.push(enriched);
-              // Track the smallest (oldest) snowflake we have seen, so once we
-              // hit the offset cap we can resume with max_id pointing at it.
-              if (!oldestIdSeenInBucket || BigInt(hit.id) < BigInt(oldestIdSeenInBucket)) {
-                oldestIdSeenInBucket = hit.id;
-              }
-            }
-          }
-
-          updateProgress(serverPage / serverPages);
-
-          // Pagination: prefer offset within a bucket; flip to max_id cursor
-          // once we approach Discord's hard 5000 offset cap.
-          if (!maxIdCursor) {
-            offset += PAGE_SIZE;
-            if (groups.length < PAGE_SIZE) break;
-            if (offset >= serverTotal) break;
-            if (offset >= OFFSET_CAP) {
-              if (!oldestIdSeenInBucket) break;
-              maxIdCursor = oldestIdSeenInBucket;
-              oldestIdSeenInBucket = null;
-              offset = 0;
-            }
-          } else {
-            if (groups.length < PAGE_SIZE) break;
-            if (!oldestIdSeenInBucket) break;
-            // Advance the cursor; if it failed to move forward there are no
-            // older results to fetch.
-            if (oldestIdSeenInBucket === maxIdCursor) break;
-            maxIdCursor = oldestIdSeenInBucket;
-            oldestIdSeenInBucket = null;
-          }
-          serverPage++;
-
-          // Proactive pacing first, then the configured per-page delay.
-          await respectRateLimit(res);
-          await sleep(PAGE_DELAY);
-        } catch (e) {
-          console.error(`[xsearch] ${g.name}`, e);
-          break;
+      const found = await searchOneGuild(g, query, (evt) => {
+        if (evt.kind === "page") {
+          serverProgress.set(g.id, evt.fraction);
+          updateProgress();
+          renderStatus(`${evt.guild} page ${evt.page}/${evt.totalPages}`);
+        } else if (evt.kind === "ratelimit") {
+          renderStatus(`${evt.guild} rate-limited, waiting ${evt.remaining}s`);
+        } else if (evt.kind === "indexing") {
+          renderStatus(`${evt.guild} indexing (attempt ${evt.attempt})`);
         }
-      }
+      });
 
-      // Server finished (0 results, all pages done, error, or skip).
-      // Advance the bar by completing this server's full slice.
+      for (const m of found) all.push(m);
+      serverProgress.delete(g.id);
       completedServers++;
-      updateProgress(0);
+      updateProgress();
+      renderStatus(`finished ${g.name}`);
 
-      if (s < total - 1 && !stopRequested) {
-        status.textContent = `Waiting before next server... (${all.length} results so far)`;
-        await sleep(SERVER_DELAY);
-      }
-    }
+      // Inter-server think pause within a worker, jittered. Skipped on the
+      // last item per worker (queue is empty) by virtue of the loop exit.
+      if (!stopRequested && !hardKill) await jitteredSleep(SERVER_DELAY);
+    }, concurrency);
 
     // Deduplicate by message id (cursor + offset modes can occasionally overlap).
     const seenIds = new Set();
@@ -821,14 +1082,26 @@
     }
     deduped.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     lastResults = deduped;
-    status.textContent = `${deduped.length} total results across ${total} servers${stopRequested ? " (stopped early)" : ""}`;
+
+    let finalNote = "";
+    if (hardKill) finalNote = " (HALTED: token rejected or account flagged - re-inject script)";
+    else if (stopRequested) finalNote = " (stopped early)";
+    status.textContent = `${deduped.length} total results across ${total} servers${finalNote}`;
     progressWrap.style.display = "none";
     progressBar.style.width = "100%";
     exportBtn.disabled = deduped.length === 0;
     goBtn.disabled = false;
     stopBtn.disabled = true;
 
-    for (const m of deduped) renderResult(m);
+    // Render in chunks via requestAnimationFrame so 5000+ results do not lock
+    // the UI thread for seconds. Each frame renders up to 50 results.
+    let i = 0;
+    const renderChunk = () => {
+      const end = Math.min(deduped.length, i + 50);
+      for (; i < end; i++) renderResult(deduped[i]);
+      if (i < deduped.length) requestAnimationFrame(renderChunk);
+    };
+    renderChunk();
   };
 
   // CSV export (local file download only, no network requests)
@@ -869,11 +1142,24 @@
   };
 
   overlay.querySelector("#xsearch-go").onclick = () => {
-    currentQuery = overlay.querySelector("#xsearch-q").value.trim();
-    if (!currentQuery) return;
+    const raw = overlay.querySelector("#xsearch-q").value.trim();
+    const status = overlay.querySelector("#xsearch-status");
+    if (!raw) {
+      status.textContent = "Enter a search query first.";
+      overlay.querySelector("#xsearch-q").focus();
+      return;
+    }
+    if (raw.length < 2) {
+      status.textContent = "Query must be at least 2 characters.";
+      return;
+    }
+    currentQuery = raw;
     search(currentQuery);
   };
-  overlay.querySelector("#xsearch-stop").onclick = () => { stopRequested = true; };
+  overlay.querySelector("#xsearch-stop").onclick = () => {
+    stopRequested = true;
+    overlay.querySelector("#xsearch-status").textContent += " - stopping...";
+  };
   overlay.querySelector("#xsearch-export").onclick = exportCsv;
   overlay.querySelector("#xsearch-q").addEventListener("keydown", e => {
     if (e.key === "Enter" && !overlay.querySelector("#xsearch-go").disabled) {
