@@ -1,4 +1,58 @@
 (() => {
+  // ================================================================
+  // FEATURE 4: Fetch + XHR interception for auth token and API version
+  // ================================================================
+  // Patch fetch and XHR immediately so we passively capture the
+  // Authorization header and API version from any outgoing Discord API
+  // request. Both patches are fully transparent and forward all calls to
+  // the originals. Restores itself once both values are captured.
+  let _capturedToken = null;
+  let _capturedApiVersion = null;
+  const _origFetch = window.fetch;
+  const _origXHROpen = XMLHttpRequest.prototype.open;
+  const _origXHRSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+  const _xhrUrls = new WeakMap();
+
+  const _netCapture = (urlStr, authHeader) => {
+    if (!urlStr || !urlStr.includes("discord.com/api/")) return;
+    if (!_capturedApiVersion) {
+      const m = urlStr.match(/discord(?:app)?\.com\/api\/(v\d+)\//);
+      if (m) _capturedApiVersion = m[1];
+    }
+    if (!_capturedToken && typeof authHeader === "string" && authHeader.length > 30)
+      _capturedToken = authHeader;
+    if (_capturedToken && _capturedApiVersion) {
+      window.fetch = _origFetch;
+      XMLHttpRequest.prototype.open = _origXHROpen;
+      XMLHttpRequest.prototype.setRequestHeader = _origXHRSetHeader;
+    }
+  };
+
+  window.fetch = function(url, init) {
+    try {
+      const urlStr = String(typeof url === "string" ? url : (url?.url ?? url));
+      let auth;
+      if (init?.headers instanceof Headers) auth = init.headers.get("authorization");
+      else if (init?.headers) auth = init.headers["authorization"] ?? init.headers["Authorization"];
+      _netCapture(urlStr, auth);
+    } catch (e) {}
+    return _origFetch.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.open = function(method, url) {
+    try { _xhrUrls.set(this, String(url)); } catch (e) {}
+    return _origXHROpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    try {
+      if (name.toLowerCase() === "authorization")
+        _netCapture(_xhrUrls.get(this) ?? "", value);
+    } catch (e) {}
+    return _origXHRSetHeader.apply(this, arguments);
+  };
+
+  // ================================================================
   // Webpack chunk discovery: try the known name first, then scan window
   // for any property matching the webpackChunk* pattern in case Discord
   // renames the app bundle
@@ -79,6 +133,37 @@
   };
   const _candidates = _buildCandidates();
 
+  // ================================================================
+  // FEATURE 1: Dynamic API base URL detection
+  // ================================================================
+  // Detect the live API version instead of hardcoding v9. Priority order:
+  // 1. Already captured from a live request (most authoritative)
+  // 2. window.GLOBAL_ENV.API_ENDPOINT exposed by Discord's client build
+  // 3. Webpack module export containing an API URL string with a version
+  // 4. Hardcoded fallback
+  const getApiBase = () => {
+    if (_capturedApiVersion) return `https://discord.com/api/${_capturedApiVersion}`;
+    try {
+      const env = window.GLOBAL_ENV;
+      if (env?.API_ENDPOINT) {
+        const ep = env.API_ENDPOINT.replace(/\/$/, "");
+        if (/\/v\d+$/.test(ep)) return ep;
+        if (env.API_VERSION != null) return `${ep}/v${env.API_VERSION}`;
+      }
+    } catch (e) {}
+    for (const exp of _candidates) {
+      try {
+        for (const key of Object.keys(exp)) {
+          const val = exp[key];
+          if (typeof val === "string" && /^https:\/\/discord(?:app)?\.com\/api\/v\d+$/.test(val))
+            return val;
+        }
+      } catch (e) {}
+    }
+    return "https://discord.com/api/v9";
+  };
+  const API_BASE = getApiBase();
+
   // TOKEN HANDLING: the token is read from Discord's own internal stores
   // (the same way Discord itself reads it) and is ONLY ever sent to
   // discord.com in the authorization header of search requests.
@@ -86,42 +171,84 @@
   // You can verify this by searching this entire script for "token":
   // it only appears in this function, the variable assignment below,
   // and the fetch() call in the search loop.
+  const jwtLike = /^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{10,}$/;
+  const isTokenLike = (t) => typeof t === "string" && t.length > 30 && jwtLike.test(t);
+
   const getToken = () => {
-    // Strategy 1: read from Discord's own webpack auth store (kept in memory)
+    // Strategy 1: network capture (set by the fetch/XHR patch above; most resilient)
+    if (_capturedToken) return _capturedToken;
+    // Strategy 2: read from Discord's own webpack auth store (kept in memory)
     for (const exp of _candidates) {
       try {
         if (typeof exp.getToken !== "function") continue;
-        const t = exp.getToken(); // reads from Discord's internal auth module, not transmitted
-        if (typeof t === "string" && t.length > 30) return t;
+        const t = exp.getToken();
+        if (isTokenLike(t)) return t;
       } catch (e) {}
     }
-    // Strategy 2: read from localStorage (older builds stored it here)
+    // Strategy 3: read from localStorage (older builds stored it here)
     try {
-      const raw = localStorage.getItem("token"); // reads locally, not transmitted
+      const raw = localStorage.getItem("token");
       if (raw) {
         const cleaned = raw.replace(/^"|"$/g, "");
-        if (cleaned.length > 30) return cleaned;
+        if (isTokenLike(cleaned)) return cleaned;
       }
     } catch (e) {}
+    // Strategy 4 (FEATURE 3): schema-based structural scan
+    // Call every zero-argument function on modules that look like store modules
+    // (2 to 30 methods, to avoid large dispatch modules with side effects).
+    // A JWT-shaped return value is highly distinctive, so false positives are rare.
+    for (const exp of _candidates) {
+      try {
+        const fns = Object.keys(exp).filter(k => typeof exp[k] === "function");
+        if (fns.length < 2 || fns.length > 30) continue;
+        for (const key of fns) {
+          const t = exp[key]();
+          if (isTokenLike(t)) return t;
+        }
+      } catch (e) {}
+    }
     return null;
   };
 
-  // Guilds: validates that the returned value is a plain object whose
-  // entries have .id and .name properties (real guild data), so i18n
-  // or unrelated modules with a getGuilds method are skipped.
+  // Guilds: validates that the returned value is a map of guild-shaped objects
+  // using guild-specific fields (features, roles, ownerId) so other id/name maps
+  // from unrelated modules are not mistaken for guild data.
+  const looksLikeGuild = (v) =>
+    v && typeof v.id === "string" && typeof v.name === "string"
+    && (Array.isArray(v.features) || Array.isArray(v.roles) || v.ownerId != null);
+
+  const isGuildMap = (obj) => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+    const vals = Object.values(obj);
+    if (vals.length === 0) return false;
+    return vals.slice(0, Math.min(3, vals.length)).every(looksLikeGuild);
+  };
+
+  const extractGuildList = (obj) =>
+    Object.values(obj)
+      .filter(v => v?.id && v?.name)
+      .map(v => ({ id: v.id, name: v.name }));
+
   const getGuilds = () => {
+    // Strategy 1: name-based (fast path)
     for (const exp of _candidates) {
       try {
         if (typeof exp.getGuilds !== "function") continue;
         const g = exp.getGuilds();
-        if (!g || typeof g !== "object" || Array.isArray(g)) continue;
-        const vals = Object.values(g);
-        if (vals.length === 0) continue;
-        const first = vals[0];
-        if (!first || !first.id || !first.name) continue;
-        return vals
-          .filter(v => v && v.id && v.name)
-          .map(v => ({ id: v.id, name: v.name }));
+        if (isGuildMap(g)) return extractGuildList(g);
+      } catch (e) {}
+    }
+    // Strategy 2 (FEATURE 3): schema-based structural scan
+    // Call every function on every module and check if the return value is
+    // a map of guild-shaped objects. Guild-specific fields (features, roles,
+    // ownerId) prevent false matches against other id/name maps.
+    for (const exp of _candidates) {
+      try {
+        for (const key of Object.keys(exp)) {
+          if (typeof exp[key] !== "function") continue;
+          const result = exp[key]();
+          if (isGuildMap(result)) return extractGuildList(result);
+        }
       } catch (e) {}
     }
     return [];
@@ -141,21 +268,40 @@
   // Strategy 2: selectChannel (ChannelActions module)
   // Strategy 3: history.pushState + popstate (no webpack module needed)
   const getTransitionTo = () => {
-    const mod = findModule(m =>
-      typeof m.transitionTo === "function" && typeof m.replaceWith === "function"
-    ) || findModule(m =>
-      typeof m.transitionTo === "function"
+    // Strategy 1: name-based with paired method verification
+    const mod =
+      findModule(m => typeof m.transitionTo === "function" && typeof m.replaceWith === "function")
+      ?? findModule(m => typeof m.transitionTo === "function");
+    if (mod) return mod.transitionTo.bind(mod);
+    // Strategy 2 (FEATURE 3): schema-based router detection
+    // React Router exposes a history object with push/replace and a location
+    // with pathname. This shape is distinctive enough to match without names.
+    const routerMod = findModule(m =>
+      m?.history && typeof m.history.push === "function"
+      && typeof m.history.replace === "function"
+      && m?.location && typeof m.location.pathname === "string"
     );
-    return mod ? mod.transitionTo.bind(mod) : null;
+    if (routerMod) return (path) => routerMod.history.push(path);
+    return null;
   };
 
   const getSelectChannel = () => {
-    const mod = findModule(m =>
-      typeof m.selectChannel === "function" && typeof m.selectVoiceChannel === "function"
-    ) || findModule(m =>
-      typeof m.selectChannel === "function"
+    // Strategy 1: name-based with paired method verification
+    const mod =
+      findModule(m => typeof m.selectChannel === "function" && typeof m.selectVoiceChannel === "function")
+      ?? findModule(m => typeof m.selectChannel === "function");
+    if (mod) return mod.selectChannel.bind(mod);
+    // Strategy 2 (FEATURE 3): find a channel-actions module by characteristic
+    // sibling methods (selectVoiceChannel, selectPrivateChannel) even when
+    // selectChannel itself has been renamed by minification.
+    const chanMod = findModule(m =>
+      typeof m.selectVoiceChannel === "function" || typeof m.selectPrivateChannel === "function"
     );
-    return mod ? mod.selectChannel.bind(mod) : null;
+    if (chanMod) {
+      const fn = chanMod.selectChannel ?? chanMod.selectPrivateChannel ?? chanMod.selectVoiceChannel;
+      if (typeof fn === "function") return fn.bind(chanMod);
+    }
+    return null;
   };
 
   const transitionTo = getTransitionTo();
@@ -176,60 +322,79 @@
   // Token is stored in a local variable scoped to this IIFE. It never
   // leaves this closure and is only used in the authorization header
   // of fetch() calls to discord.com (see the search function below).
-  const token = getToken();
-  if (!token) { console.error("[xsearch] Could not retrieve token."); return; }
+  let token = getToken();
 
   const guilds = getGuilds().sort((a, b) => a.name.localeCompare(b.name));
   if (guilds.length === 0) { console.error("[xsearch] Found 0 guilds."); return; }
-  console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel)}`);
+  if (!token) console.warn("[xsearch] Token not found via webpack; will retry at search time via network capture.");
+  console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel)}, api=${API_BASE}`);
+
+  // ================================================================
+  // FEATURE 5: CSP-resilient style injection
+  // ================================================================
+  // Use Constructable CSSStyleSheet (programmatically created, not subject
+  // to style-src unsafe-inline restrictions) with a <style> element fallback
+  // for older browsers. Calling _removeStyles() cleans up on close.
+  const CSS_TEXT = `
+    #xsearch-overlay { position: fixed; top: 50px; right: 50px; width: 760px; max-width: 90vw; background: #2b2d31; color: #dbdee1; border: 1px solid #1e1f22; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 99999; font-family: system-ui, sans-serif; display: flex; flex-direction: column; }
+    #xsearch-overlay.expanded { height: 750px; max-height: 88vh; }
+    #xsearch-header { padding: 10px 14px; background: #1e1f22; cursor: move; display: flex; justify-content: space-between; align-items: center; user-select: none; border-radius: 8px 8px 0 0; }
+    #xsearch-overlay:not(.expanded) #xsearch-header { border-radius: 8px; }
+    #xsearch-header strong { font-size: 14px; }
+    #xsearch-header-actions { display: flex; gap: 6px; align-items: center; }
+    #xsearch-toggle, #xsearch-close { color: #fff; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+    #xsearch-toggle { background: #4e5058; }
+    #xsearch-close { background: #ed4245; }
+    #xsearch-body { padding: 14px; overflow-y: auto; flex: 1; }
+    #xsearch-overlay:not(.expanded) #xsearch-body { display: none; }
+    #xsearch-overlay input[type=text] { width: 100%; padding: 9px 12px; background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
+    #xsearch-controls { display: flex; gap: 8px; margin-top: 8px; }
+    #xsearch-overlay button.act { padding: 8px 14px; background: #5865f2; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    #xsearch-overlay button.act.alt { background: #3ba55d; }
+    #xsearch-overlay button.act.ghost { background: #4e5058; }
+    #xsearch-overlay button.act:disabled { opacity: 0.5; cursor: not-allowed; }
+    #xsearch-servers-wrap { background: #1e1f22; border-radius: 6px; margin: 12px 0; border: 1px solid #2b2d31; }
+    #xsearch-servers-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid #2b2d31; }
+    #xsearch-servers-head .lbl { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #b5bac1; font-weight: 600; }
+    #xsearch-servers-head .mini { background: transparent; color: #5865f2; border: none; cursor: pointer; font-size: 12px; padding: 2px 6px; }
+    #xsearch-servers-head .mini:hover { color: #818cf8; }
+    #xsearch-servers { padding: 8px; max-height: 240px; overflow-y: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
+    #xsearch-servers label { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; cursor: pointer; color: #dbdee1; transition: background 0.1s; min-width: 0; }
+    #xsearch-servers label:hover { background: #2b2d31; }
+    #xsearch-servers label span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #xsearch-servers input[type=checkbox] { appearance: none; width: 16px; height: 16px; border: 1.5px solid #4e5058; border-radius: 3px; background: #2b2d31; cursor: pointer; flex-shrink: 0; position: relative; }
+    #xsearch-servers input[type=checkbox]:checked { background: #5865f2; border-color: #5865f2; }
+    #xsearch-servers input[type=checkbox]:checked::after { content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+    #xsearch-status { font-size: 12px; color: #b5bac1; margin: 8px 0; }
+    #xsearch-progress-wrap { background: #1e1f22; border-radius: 4px; height: 14px; margin: 6px 0; overflow: hidden; display: none; }
+    #xsearch-progress-bar { background: #5865f2; height: 100%; width: 0%; transition: width 0.2s ease; }
+    #xsearch-overlay .msg { background: #313338; padding: 10px; border-radius: 4px; margin: 6px 0; cursor: pointer; border-left: 3px solid #5865f2; }
+    #xsearch-overlay .msg:hover { background: #383a40; }
+    #xsearch-overlay .msg .meta { font-size: 11px; color: #b5bac1; margin-bottom: 4px; }
+    #xsearch-overlay .msg .content { font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  `;
+
+  let _removeStyles = null;
+  const injectStyles = (cssText) => {
+    try {
+      const sheet = new CSSStyleSheet();
+      sheet.replaceSync(cssText);
+      document.adoptedStyleSheets = [...(document.adoptedStyleSheets ?? []), sheet];
+      return () => { document.adoptedStyleSheets = document.adoptedStyleSheets.filter(s => s !== sheet); };
+    } catch (e) {}
+    const style = document.createElement("style");
+    style.textContent = cssText;
+    (document.head ?? document.documentElement).appendChild(style);
+    return () => style.remove();
+  };
 
   // Overlay UI
   document.getElementById("xsearch-overlay")?.remove();
+  _removeStyles?.();
 
   const overlay = document.createElement("div");
   overlay.id = "xsearch-overlay";
   overlay.innerHTML = `
-    <style>
-      #xsearch-overlay { position: fixed; top: 50px; right: 50px; width: 760px; max-width: 90vw; background: #2b2d31; color: #dbdee1; border: 1px solid #1e1f22; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 99999; font-family: system-ui, sans-serif; display: flex; flex-direction: column; }
-      #xsearch-overlay.expanded { height: 750px; max-height: 88vh; }
-      #xsearch-header { padding: 10px 14px; background: #1e1f22; cursor: move; display: flex; justify-content: space-between; align-items: center; user-select: none; border-radius: 8px 8px 0 0; }
-      #xsearch-overlay:not(.expanded) #xsearch-header { border-radius: 8px; }
-      #xsearch-header strong { font-size: 14px; }
-      #xsearch-header-actions { display: flex; gap: 6px; align-items: center; }
-      #xsearch-toggle, #xsearch-close { color: #fff; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
-      #xsearch-toggle { background: #4e5058; }
-      #xsearch-close { background: #ed4245; }
-      #xsearch-body { padding: 14px; overflow-y: auto; flex: 1; }
-      #xsearch-overlay:not(.expanded) #xsearch-body { display: none; }
-      #xsearch-overlay input[type=text] { width: 100%; padding: 9px 12px; background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
-      #xsearch-controls { display: flex; gap: 8px; margin-top: 8px; }
-      #xsearch-overlay button.act { padding: 8px 14px; background: #5865f2; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
-      #xsearch-overlay button.act.alt { background: #3ba55d; }
-      #xsearch-overlay button.act.ghost { background: #4e5058; }
-      #xsearch-overlay button.act:disabled { opacity: 0.5; cursor: not-allowed; }
-
-      /* Server picker */
-      #xsearch-servers-wrap { background: #1e1f22; border-radius: 6px; margin: 12px 0; border: 1px solid #2b2d31; }
-      #xsearch-servers-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid #2b2d31; }
-      #xsearch-servers-head .lbl { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #b5bac1; font-weight: 600; }
-      #xsearch-servers-head .mini { background: transparent; color: #5865f2; border: none; cursor: pointer; font-size: 12px; padding: 2px 6px; }
-      #xsearch-servers-head .mini:hover { color: #818cf8; }
-      #xsearch-servers { padding: 8px; max-height: 240px; overflow-y: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
-      #xsearch-servers label { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; cursor: pointer; color: #dbdee1; transition: background 0.1s; min-width: 0; }
-      #xsearch-servers label:hover { background: #2b2d31; }
-      #xsearch-servers label span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      #xsearch-servers input[type=checkbox] { appearance: none; width: 16px; height: 16px; border: 1.5px solid #4e5058; border-radius: 3px; background: #2b2d31; cursor: pointer; flex-shrink: 0; position: relative; }
-      #xsearch-servers input[type=checkbox]:checked { background: #5865f2; border-color: #5865f2; }
-      #xsearch-servers input[type=checkbox]:checked::after { content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
-
-      #xsearch-status { font-size: 12px; color: #b5bac1; margin: 8px 0; }
-      #xsearch-progress-wrap { background: #1e1f22; border-radius: 4px; height: 14px; margin: 6px 0; overflow: hidden; display: none; }
-      #xsearch-progress-bar { background: #5865f2; height: 100%; width: 0%; transition: width 0.2s ease; }
-      #xsearch-overlay .msg { background: #313338; padding: 10px; border-radius: 4px; margin: 6px 0; cursor: pointer; border-left: 3px solid #5865f2; }
-      #xsearch-overlay .msg:hover { background: #383a40; }
-      #xsearch-overlay .msg .meta { font-size: 11px; color: #b5bac1; margin-bottom: 4px; }
-      #xsearch-overlay .msg .content { font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
-    </style>
     <div id="xsearch-header">
       <strong>Cross-Server Search</strong>
       <div id="xsearch-header-actions">
@@ -260,6 +425,7 @@
     </div>
   `;
   overlay.classList.add("expanded");
+  _removeStyles = injectStyles(CSS_TEXT);
   document.body.appendChild(overlay);
 
   // Drag handling
@@ -297,6 +463,7 @@
   };
   overlay.querySelector("#xsearch-close").onclick = (e) => {
     e.stopPropagation();
+    _removeStyles?.();
     overlay.remove();
   };
 
@@ -340,11 +507,12 @@
   };
 
   const search = async (query) => {
+    // Re-check token here; it may have been captured from the network after init
+    if (!token) token = getToken();
     const checked = [...serversDiv.querySelectorAll("input:checked")].map(i => ({
       id: i.dataset.id,
       name: i.parentElement.querySelector("span").textContent.trim()
     }));
-    if (checked.length === 0) { alert("Select at least one server."); return; }
 
     const status = overlay.querySelector("#xsearch-status");
     const results = overlay.querySelector("#xsearch-results");
@@ -362,6 +530,13 @@
     stopBtn.disabled = false;
     stopRequested = false;
     lastResults = [];
+
+    if (!token) {
+      status.textContent = "Error: could not retrieve auth token. Try navigating to a channel first.";
+      goBtn.disabled = false;
+      return;
+    }
+    if (checked.length === 0) { alert("Select at least one server."); return; }
 
     const all = [];
     const total = checked.length;
@@ -398,13 +573,27 @@
         try {
           // NETWORK REQUEST: search sent to discord.com only (never any third party)
           // This is the ONLY place the token is used after retrieval
-          const url = `https://discord.com/api/v9/guilds/${g.id}/messages/search?content=${encodeURIComponent(query)}&offset=${offset}`;
-          const res = await fetch(url, { headers: { authorization: token } }); // token sent to discord.com only
+          const url = `${API_BASE}/guilds/${g.id}/messages/search?content=${encodeURIComponent(query)}&offset=${offset}`;
+          const res = await fetch(url, { headers: { authorization: token } });
 
+          // ================================================================
+          // FEATURE 2: Parse Retry-After header/body instead of hardcoding 20s
+          // ================================================================
           if (res.status === 429) {
-            for (let countdown = 20; countdown > 0; countdown--) {
+            let retryMs = 20000;
+            try {
+              const headerVal = res.headers.get("Retry-After");
+              if (headerVal != null) {
+                retryMs = parseFloat(headerVal) * 1000;
+              } else {
+                const body = await res.json();
+                if (typeof body.retry_after === "number") retryMs = body.retry_after * 1000;
+              }
+            } catch (e) {}
+            const totalSecs = Math.max(1, Math.ceil(retryMs / 1000));
+            for (let remaining = totalSecs; remaining > 0; remaining--) {
               if (stopRequested) break outer;
-              status.textContent = `Rate limited (429) on ${g.name} page ${serverPage} - retrying in ${countdown}s...`;
+              status.textContent = `Rate limited (429) on ${g.name} page ${serverPage} - retrying in ${remaining}s...`;
               await sleep(1000);
             }
             continue;
