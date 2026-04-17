@@ -1,89 +1,145 @@
 (() => {
-  // ---------- Webpack access ----------
-  let _wpRequire = null;
-  const wp = () => {
-    if (_wpRequire) return _wpRequire;
-    _wpRequire = window.webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
-    window.webpackChunkdiscord_app.pop();
-    return _wpRequire;
-  };
-
-  const candidatesOf = (mod) => {
-    if (!mod?.exports) return [];
-    const out = [mod.exports];
-    try {
-      for (const k of Object.keys(mod.exports)) {
-        const v = mod.exports[k];
-        if (v && typeof v === "object") out.push(v);
-      }
-    } catch (e) {}
-    return out;
-  };
-
-  const findModule = (filter) => {
-    const wpRequire = wp();
-    for (const id in wpRequire.c) {
+  // Webpack chunk discovery: try the known name first, then scan window
+  // for any property matching the webpackChunk* pattern in case Discord
+  // renames the app bundle
+  const getWebpackChunk = () => {
+    if (window.webpackChunkdiscord_app) return window.webpackChunkdiscord_app;
+    for (const key of Object.getOwnPropertyNames(window)) {
       try {
-        for (const exp of candidatesOf(wpRequire.c[id])) {
-          try { if (filter(exp)) return exp; } catch (e) {}
+        if (key.startsWith("webpackChunk") && Array.isArray(window[key]) && window[key].push) {
+          return window[key];
         }
       } catch (e) {}
     }
     return null;
   };
 
-  const findByFilters = (filters) => {
-    for (const f of filters) {
-      const m = findModule(f);
-      if (m) return m;
+  let _wpRequire = null;
+  const wp = () => {
+    if (_wpRequire) return _wpRequire;
+    const chunk = getWebpackChunk();
+    if (!chunk) return null;
+    _wpRequire = chunk.push([[Symbol()], {}, r => r]);
+    chunk.pop();
+    return _wpRequire;
+  };
+
+  // Extract all possible export surfaces from a webpack module.
+  // Checks the top level, the default export, and all object valued
+  // keys so renamed or restructured modules still surface.
+  const candidatesOf = (mod) => {
+    if (!mod?.exports) return [];
+    const seen = new Set();
+    const out = [];
+    const add = (v) => {
+      if (v && typeof v === "object" && !seen.has(v)) {
+        seen.add(v);
+        out.push(v);
+      }
+    };
+    add(mod.exports);
+    try {
+      if (mod.exports.default) add(mod.exports.default);
+      for (const k of Object.keys(mod.exports)) {
+        add(mod.exports[k]);
+      }
+    } catch (e) {}
+    return out;
+  };
+
+  // Build and cache a flat list of every exported object across all
+  // webpack modules. Cached because the module graph is static at runtime.
+  const _buildCandidates = () => {
+    const wpRequire = wp();
+    if (!wpRequire || !wpRequire.c) return [];
+    const out = [];
+    for (const id in wpRequire.c) {
+      try {
+        for (const exp of candidatesOf(wpRequire.c[id])) {
+          out.push(exp);
+        }
+      } catch (e) {}
+    }
+    return out;
+  };
+  const _candidates = _buildCandidates();
+
+  // TOKEN HANDLING: the token is read from Discord's own internal stores P.S. haha line 67 funny
+  // (the same way Discord itself reads it) and is ONLY ever sent to
+  // discord.com in the authorization header of search requests.
+  // It is never logged, stored externally, or transmitted anywhere else.
+  // You can verify this by searching this entire script for "token":
+  // it only appears in this function, the variable assignment below,
+  // and the fetch() call in the search loop.
+  const getToken = () => {
+    // Strategy 1: read from Discord's own webpack auth store (kept in memory)
+    for (const exp of _candidates) {
+      try {
+        if (typeof exp.getToken !== "function") continue;
+        const t = exp.getToken(); // reads from Discord's internal auth module, not transmitted
+        if (typeof t === "string" && t.length > 30) return t;
+      } catch (e) {}
+    }
+    // Strategy 2: read from localStorage (older builds stored it here)
+    try {
+      const raw = localStorage.getItem("token"); // reads locally, not transmitted
+      if (raw) {
+        const cleaned = raw.replace(/^"|"$/g, "");
+        if (cleaned.length > 30) return cleaned;
+      }
+    } catch (e) {}
+    return null;
+  };
+
+  // Guilds: validates that the returned value is a plain object whose
+  // entries have .id and .name properties (real guild data), so i18n
+  // or unrelated modules with a getGuilds method are skipped.
+  const getGuilds = () => {
+    for (const exp of _candidates) {
+      try {
+        if (typeof exp.getGuilds !== "function") continue;
+        const g = exp.getGuilds();
+        if (!g || typeof g !== "object" || Array.isArray(g)) continue;
+        const vals = Object.values(g);
+        if (vals.length === 0) continue;
+        const first = vals[0];
+        if (!first || !first.id || !first.name) continue;
+        return vals
+          .filter(v => v && v.id && v.name)
+          .map(v => ({ id: v.id, name: v.name }));
+      } catch (e) {}
+    }
+    return [];
+  };
+
+  // Generic module finder for navigation lookups
+  const findModule = (filter) => {
+    for (const exp of _candidates) {
+      try { if (filter(exp)) return exp; } catch (e) {}
     }
     return null;
   };
 
-  // ---------- Token ----------
-  const getToken = () => {
-    const mod = findByFilters([
-      m => typeof m.getToken === "function" && typeof m.setToken === "function" && typeof m.hideToken === "function",
-      m => typeof m.getToken === "function" && typeof m.getId === "function" && typeof m.getEmail === "function",
-      m => typeof m.getToken === "function" && typeof m.setToken === "function",
-      m => typeof m.getToken === "function" && typeof m.getAnalyticsToken === "function",
-    ]);
-    if (!mod) return null;
-    try { return mod.getToken(); } catch (e) { return null; }
-  };
-
-  // ---------- Guilds ----------
-  const getGuilds = () => {
-    const mod = findByFilters([
-      m => typeof m.getGuild === "function" && typeof m.getGuilds === "function" && typeof m.getGuildCount === "function",
-      m => typeof m.getGuild === "function" && typeof m.getGuilds === "function",
-      m => typeof m.getGuilds === "function",
-    ]);
-    if (!mod) return [];
-    try {
-      const guilds = mod.getGuilds();
-      return Object.values(guilds || {})
-        .filter(g => g && g.id && g.name)
-        .map(g => ({ id: g.id, name: g.name }));
-    } catch (e) {
-      return [];
-    }
-  };
-
-  // ---------- Navigation ----------
+  // Navigation: three fallback strategies so renames of any single
+  // internal module do not break message jumping.
+  // Strategy 1: transitionTo (Router module, most common)
+  // Strategy 2: selectChannel (ChannelActions module)
+  // Strategy 3: history.pushState + popstate (no webpack module needed)
   const getTransitionTo = () => {
-    const mod = findByFilters([
-      m => typeof m.transitionTo === "function" && typeof m.replaceWith === "function",
-      m => typeof m.transitionTo === "function",
-    ]);
+    const mod = findModule(m =>
+      typeof m.transitionTo === "function" && typeof m.replaceWith === "function"
+    ) || findModule(m =>
+      typeof m.transitionTo === "function"
+    );
     return mod ? mod.transitionTo.bind(mod) : null;
   };
 
   const getSelectChannel = () => {
-    const mod = findByFilters([
-      m => typeof m.selectChannel === "function" && typeof m.selectVoiceChannel === "function",
-      m => typeof m.selectChannel === "function",
-    ]);
+    const mod = findModule(m =>
+      typeof m.selectChannel === "function" && typeof m.selectVoiceChannel === "function"
+    ) || findModule(m =>
+      typeof m.selectChannel === "function"
+    );
     return mod ? mod.selectChannel.bind(mod) : null;
   };
 
@@ -94,13 +150,17 @@
     const path = `/channels/${guildId}/${channelId}/${messageId}`;
     try { if (transitionTo) { transitionTo(path); return; } } catch (e) {}
     try { if (selectChannel) { selectChannel({ guildId, channelId, messageId }); return; } } catch (e) {}
+    // Fallback: direct history manipulation (no webpack module needed)
     try {
       window.history.pushState({}, "", path);
       window.dispatchEvent(new PopStateEvent("popstate"));
     } catch (e) { console.error("[xsearch] no navigation method worked", e); }
   };
 
-  // ---------- Init ----------
+  // Init
+  // Token is stored in a local variable scoped to this IIFE. It never
+  // leaves this closure and is only used in the authorization header
+  // of fetch() calls to discord.com (see the search function below).
   const token = getToken();
   if (!token) { console.error("[xsearch] Could not retrieve token."); return; }
 
@@ -108,7 +168,7 @@
   if (guilds.length === 0) { console.error("[xsearch] Found 0 guilds."); return; }
   console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel)}`);
 
-  // ---------- Overlay ----------
+  // Overlay UI
   document.getElementById("xsearch-overlay")?.remove();
 
   const overlay = document.createElement("div");
@@ -240,7 +300,7 @@
     serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = false);
   };
 
-  // ---------- Search ----------
+  // Search state
   let currentQuery = "";
   let lastResults = [];
   let stopRequested = false;
@@ -306,15 +366,17 @@
         status.textContent = `Server ${s + 1}/${total}: ${g.name} - ${pageInfo} (${all.length} results so far)`;
 
         try {
+          // NETWORK REQUEST: search sent to discord.com only (never any third party)
+          // This is the ONLY place the token is used after retrieval
           const url = `https://discord.com/api/v9/guilds/${g.id}/messages/search?content=${encodeURIComponent(query)}&offset=${offset}`;
-          const res = await fetch(url, { headers: { authorization: token } });
+          const res = await fetch(url, { headers: { authorization: token } }); // token sent to discord.com only
           if (res.status === 429) {
             for (let countdown = 20; countdown > 0; countdown--) {
               if (stopRequested) break outer;
               status.textContent = `Rate limited (429) on ${g.name} page ${serverPage} - retrying in ${countdown}s...`;
               await sleep(1000);
             }
-            continue; // retry same offset/page
+            continue;
           }
           if (!res.ok) {
             console.warn(`[xsearch] ${g.name} returned ${res.status}`);
@@ -323,7 +385,6 @@
           const data = await res.json();
           if (serverTotal == null) {
             serverTotal = data.total_results || 0;
-            // Estimate work remaining: assume each remaining server has at least 1 page
             totalRequests = completedRequests + Math.max(1, Math.ceil(serverTotal / PAGE_SIZE)) + (total - s - 1);
           }
           const groups = data.messages || [];
@@ -340,12 +401,10 @@
           completedRequests++;
           progressBar.style.width = `${Math.min(100, (completedRequests / Math.max(1, totalRequests)) * 100)}%`;
 
-          // Last page reached?
           offset += PAGE_SIZE;
           if (offset >= serverTotal || groups.length < PAGE_SIZE) break;
           serverPage++;
 
-          // Between pages of the same server
           await sleep(PAGE_DELAY);
         } catch (e) {
           console.error(`[xsearch] ${g.name}`, e);
@@ -353,7 +412,6 @@
         }
       }
 
-      // Between servers
       if (s < total - 1 && !stopRequested) {
         status.textContent = `Waiting before next server... (${all.length} results so far)`;
         await sleep(SERVER_DELAY);
@@ -372,7 +430,7 @@
     for (const m of all) renderResult(m);
   };
 
-  // ---------- CSV export ----------
+  // CSV export (local file download only, no network requests)
   const csvEscape = (v) => {
     if (v == null) return "";
     const s = String(v);
@@ -385,6 +443,7 @@
     const headers = ["timestamp", "server", "channel_id", "author", "content", "link"];
     const rows = [headers.join(",")];
     for (const m of lastResults) {
+      // This URL is written into the CSV for the user to click later, not fetched here
       const link = `https://discord.com/channels/${m._guildId}/${m.channel_id}/${m.id}`;
       rows.push([
         csvEscape(m.timestamp),
