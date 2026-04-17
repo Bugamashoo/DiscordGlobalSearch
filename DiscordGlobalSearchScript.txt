@@ -19,8 +19,12 @@
       const m = urlStr.match(/discord(?:app)?\.com\/api\/(v\d+)\//);
       if (m) _capturedApiVersion = m[1];
     }
-    if (!_capturedToken && typeof authHeader === "string" && authHeader.length > 30)
-      _capturedToken = authHeader;
+    if (!_capturedToken && typeof authHeader === "string" && authHeader.length > 30) {
+      // Strip optional "Bearer " prefix; Discord user tokens are sent raw,
+      // but bot/oauth flows include the prefix. Normalize to whatever Discord
+      // currently accepts on the search endpoint (the raw header value).
+      _capturedToken = authHeader.replace(/^Bearer\s+/i, "");
+    }
     if (_capturedToken && _capturedApiVersion) {
       window.fetch = _origFetch;
       XMLHttpRequest.prototype.open = _origXHROpen;
@@ -69,12 +73,24 @@
   };
 
   let _wpRequire = null;
+  // Webpack chunk IDs are tracked in installedChunks; using Symbol() is fragile
+  // because newer webpack builds key chunks via Map keys and may type-check.
+  // Use a stable unique string ID instead so the push registers cleanly.
+  const _wpProbeId = "_xsearch_probe_" + Math.random().toString(36).slice(2);
   const wp = () => {
     if (_wpRequire) return _wpRequire;
     const chunk = getWebpackChunk();
     if (!chunk) return null;
-    _wpRequire = chunk.push([[Symbol()], {}, r => r]);
-    chunk.pop();
+    try {
+      _wpRequire = chunk.push([[_wpProbeId], {}, r => r]);
+      chunk.pop();
+    } catch (e) {
+      // Some builds reject empty modules; try again with a no-op module factory
+      try {
+        _wpRequire = chunk.push([[_wpProbeId + "_2"], { [_wpProbeId]: () => {} }, r => r]);
+        chunk.pop();
+      } catch (e2) {}
+    }
     return _wpRequire;
   };
 
@@ -196,11 +212,19 @@
     // Strategy 4 (FEATURE 3): schema-based structural scan
     // Call every zero-argument function on modules that look like store modules
     // (2 to 30 methods, to avoid large dispatch modules with side effects).
+    // Restrict to functions declaring zero formal parameters AND whose name is
+    // either getter-shaped (get/is/has/fetch prefix) or single-letter (likely
+    // minified) to minimize the chance of triggering side-effectful dispatchers.
     // A JWT-shaped return value is highly distinctive, so false positives are rare.
+    const safeFnNameRe = /^(?:get|is|has|fetch|read|peek)|^[a-zA-Z]$/;
     for (const exp of _candidates) {
       try {
-        const fns = Object.keys(exp).filter(k => typeof exp[k] === "function");
-        if (fns.length < 2 || fns.length > 30) continue;
+        const fns = Object.keys(exp).filter(k =>
+          typeof exp[k] === "function"
+          && exp[k].length === 0
+          && safeFnNameRe.test(k)
+        );
+        if (fns.length < 1 || fns.length > 30) continue;
         for (const key of fns) {
           const t = exp[key]();
           if (isTokenLike(t)) return t;
@@ -239,14 +263,18 @@
       } catch (e) {}
     }
     // Strategy 2 (FEATURE 3): schema-based structural scan
-    // Call every function on every module and check if the return value is
-    // a map of guild-shaped objects. Guild-specific fields (features, roles,
-    // ownerId) prevent false matches against other id/name maps.
+    // Only consider zero-argument functions whose name is getter-shaped or
+    // single-letter (likely minified). This avoids invoking action creators
+    // like leaveGuild, deleteGuild, joinGuild which take args but might also
+    // exist on the same module surface.
+    const safeFnNameRe = /^(?:get|is|has|fetch|read|peek)|^[a-zA-Z]$/;
     for (const exp of _candidates) {
       try {
         for (const key of Object.keys(exp)) {
-          if (typeof exp[key] !== "function") continue;
-          const result = exp[key]();
+          const fn = exp[key];
+          if (typeof fn !== "function" || fn.length !== 0) continue;
+          if (!safeFnNameRe.test(key)) continue;
+          const result = fn.call(exp);
           if (isGuildMap(result)) return extractGuildList(result);
         }
       } catch (e) {}
@@ -304,14 +332,34 @@
     return null;
   };
 
+  // Discord-native dispatcher fallback. Discord's internal navigation is
+  // ultimately driven by Flux actions, so dispatching CHANNEL_SELECT directly
+  // works even when both Router and ChannelActions modules have been renamed.
+  const getFluxDispatcher = () =>
+    findModule(m =>
+      typeof m.dispatch === "function"
+      && (typeof m.subscribe === "function" || typeof m._subscriptions === "object")
+      && (Array.isArray(m._actionHandlers?._orderedActionHandlers)
+          || typeof m.register === "function"
+          || typeof m.wait === "function")
+    );
+
   const transitionTo = getTransitionTo();
   const selectChannel = getSelectChannel();
+  const fluxDispatcher = getFluxDispatcher();
 
   const jumpToMessage = (guildId, channelId, messageId) => {
     const path = `/channels/${guildId}/${channelId}/${messageId}`;
     try { if (transitionTo) { transitionTo(path); return; } } catch (e) {}
     try { if (selectChannel) { selectChannel({ guildId, channelId, messageId }); return; } } catch (e) {}
-    // Fallback: direct history manipulation (no webpack module needed)
+    try {
+      if (fluxDispatcher) {
+        fluxDispatcher.dispatch({ type: "CHANNEL_SELECT", guildId, channelId, messageId });
+        return;
+      }
+    } catch (e) {}
+    // Last-resort fallback: history manipulation. Discord may not pick this up
+    // if its router does not listen on popstate, but it costs nothing to try.
     try {
       window.history.pushState({}, "", path);
       window.dispatchEvent(new PopStateEvent("popstate"));
@@ -467,11 +515,19 @@
     overlay.remove();
   };
 
+  const escapeHtml = (s) => String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
   const serversDiv = overlay.querySelector("#xsearch-servers");
   guilds.forEach(g => {
     const lbl = document.createElement("label");
-    const safeName = g.name.replace(/</g, "&lt;");
-    lbl.innerHTML = `<input type="checkbox" data-id="${g.id}" checked><span title="${safeName}">${safeName}</span>`;
+    const safeName = escapeHtml(g.name);
+    const safeId = escapeHtml(g.id);
+    lbl.innerHTML = `<input type="checkbox" data-id="${safeId}" checked><span title="${safeName}">${safeName}</span>`;
     serversDiv.appendChild(lbl);
   });
 
@@ -499,11 +555,43 @@
     const div = document.createElement("div");
     div.className = "msg";
     const date = new Date(m.timestamp).toLocaleString();
-    div.innerHTML = `<div class="meta">${m._guildName} #${m.channel_id} ${date} ${(m.author?.username || "?").replace(/</g, "&lt;")}</div>
-                     <div class="content"></div>`;
-    div.querySelector(".content").textContent = m.content || "(no text content)";
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `${m._guildName} #${m.channel_id} ${date} ${m.author?.username || "?"}`;
+    const content = document.createElement("div");
+    content.className = "content";
+    content.textContent = m.content || "(no text content)";
+    div.appendChild(meta);
+    div.appendChild(content);
     div.onclick = () => jumpToMessage(m._guildId, m.channel_id, m.id);
     results.appendChild(div);
+  };
+
+  // Discord caps the search 'offset' parameter at 5000. Beyond that we must
+  // switch to snowflake cursor pagination via 'max_id' (results older than
+  // the given message id) and reset offset to 0. This unlocks unbounded
+  // pagination through very large servers.
+  const OFFSET_CAP = 5000;
+
+  // Proactive rate-limit pacing: if Discord reports we have 0 calls left in
+  // the current bucket and gives us a reset-after time, we sleep that long
+  // BEFORE the next request to avoid even hitting a 429. Falls back to a
+  // small fixed delay between pages.
+  const respectRateLimit = async (res) => {
+    try {
+      const remaining = parseInt(res.headers.get("X-RateLimit-Remaining") ?? "", 10);
+      const resetAfter = parseFloat(res.headers.get("X-RateLimit-Reset-After") ?? "");
+      if (!Number.isNaN(remaining) && remaining <= 0 && !Number.isNaN(resetAfter) && resetAfter > 0) {
+        await sleep(Math.min(60_000, Math.ceil(resetAfter * 1000) + 100));
+      }
+    } catch (e) {}
+  };
+
+  // Cloudflare/edge sometimes returns an HTML challenge or block page with a
+  // 200 or 403 status. Detect by content-type so we do not crash JSON.parse.
+  const isJsonResponse = (res) => {
+    const ct = res.headers.get("content-type") || "";
+    return ct.includes("application/json");
   };
 
   const search = async (query) => {
@@ -556,6 +644,8 @@
     for (let s = 0; s < total; s++) {
       const g = checked[s];
       let offset = 0;
+      let maxIdCursor = null;          // snowflake cursor used after offset cap
+      let oldestIdSeenInBucket = null; // tracks oldest hit id during the current cursor bucket
       let serverTotal = null;
       let serverPage = 1;
       let serverPages = 1;
@@ -572,9 +662,17 @@
 
         try {
           // NETWORK REQUEST: search sent to discord.com only (never any third party)
-          // This is the ONLY place the token is used after retrieval
-          const url = `${API_BASE}/guilds/${g.id}/messages/search?content=${encodeURIComponent(query)}&offset=${offset}`;
-          const res = await fetch(url, { headers: { authorization: token } });
+          // This is the ONLY place the token is used after retrieval.
+          // include_nsfw=true so age-gated channels are not silently excluded.
+          const params = new URLSearchParams({ content: query, include_nsfw: "true" });
+          if (maxIdCursor) params.set("max_id", maxIdCursor);
+          else params.set("offset", String(offset));
+          const url = `${API_BASE}/guilds/${g.id}/messages/search?${params.toString()}`;
+          const res = await fetch(url, {
+            // Canonical "Authorization" casing; some edge proxies are picky.
+            headers: { Authorization: token },
+            credentials: "include"
+          });
 
           // ================================================================
           // FEATURE 2: Parse Retry-After header/body instead of hardcoding 20s
@@ -585,7 +683,7 @@
               const headerVal = res.headers.get("Retry-After");
               if (headerVal != null) {
                 retryMs = parseFloat(headerVal) * 1000;
-              } else {
+              } else if (isJsonResponse(res)) {
                 const body = await res.json();
                 if (typeof body.retry_after === "number") retryMs = body.retry_after * 1000;
               }
@@ -618,6 +716,13 @@
             break;
           }
 
+          // Cloudflare or proxy returning HTML on a "successful" status: bail
+          // for this server rather than crashing the whole run with a parse error.
+          if (!isJsonResponse(res)) {
+            console.warn(`[xsearch] ${g.name} returned non-JSON response, skipping`);
+            break;
+          }
+
           const data = await res.json();
 
           // Some Discord versions return 200 with an indexing flag in the
@@ -626,7 +731,7 @@
           // (which indicates the server acknowledged the query but has no
           // index to search yet).
           const bodyIndicatesIndexing = data.indexing
-            || (offset === 0 && data.total_results === 0 && data.analytics_id && !(data.messages?.length));
+            || (offset === 0 && !maxIdCursor && data.total_results === 0 && data.analytics_id && !(data.messages?.length));
           if (bodyIndicatesIndexing) {
             indexRetries++;
             if (indexRetries > MAX_INDEX_RETRIES) {
@@ -639,7 +744,6 @@
             continue;
           }
 
-          // Reset indexing counter on a successful real response
           indexRetries = 0;
 
           if (serverTotal == null) {
@@ -654,15 +758,41 @@
             if (hit) {
               const enriched = { ...hit, _guildId: g.id, _guildName: g.name };
               all.push(enriched);
+              // Track the smallest (oldest) snowflake we have seen, so once we
+              // hit the offset cap we can resume with max_id pointing at it.
+              if (!oldestIdSeenInBucket || BigInt(hit.id) < BigInt(oldestIdSeenInBucket)) {
+                oldestIdSeenInBucket = hit.id;
+              }
             }
           }
 
           updateProgress(serverPage / serverPages);
 
-          offset += PAGE_SIZE;
-          if (offset >= serverTotal || groups.length < PAGE_SIZE) break;
+          // Pagination: prefer offset within a bucket; flip to max_id cursor
+          // once we approach Discord's hard 5000 offset cap.
+          if (!maxIdCursor) {
+            offset += PAGE_SIZE;
+            if (groups.length < PAGE_SIZE) break;
+            if (offset >= serverTotal) break;
+            if (offset >= OFFSET_CAP) {
+              if (!oldestIdSeenInBucket) break;
+              maxIdCursor = oldestIdSeenInBucket;
+              oldestIdSeenInBucket = null;
+              offset = 0;
+            }
+          } else {
+            if (groups.length < PAGE_SIZE) break;
+            if (!oldestIdSeenInBucket) break;
+            // Advance the cursor; if it failed to move forward there are no
+            // older results to fetch.
+            if (oldestIdSeenInBucket === maxIdCursor) break;
+            maxIdCursor = oldestIdSeenInBucket;
+            oldestIdSeenInBucket = null;
+          }
           serverPage++;
 
+          // Proactive pacing first, then the configured per-page delay.
+          await respectRateLimit(res);
           await sleep(PAGE_DELAY);
         } catch (e) {
           console.error(`[xsearch] ${g.name}`, e);
@@ -681,16 +811,24 @@
       }
     }
 
-    all.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    lastResults = all;
-    status.textContent = `${all.length} total results across ${total} servers${stopRequested ? " (stopped early)" : ""}`;
+    // Deduplicate by message id (cursor + offset modes can occasionally overlap).
+    const seenIds = new Set();
+    const deduped = [];
+    for (const m of all) {
+      if (seenIds.has(m.id)) continue;
+      seenIds.add(m.id);
+      deduped.push(m);
+    }
+    deduped.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    lastResults = deduped;
+    status.textContent = `${deduped.length} total results across ${total} servers${stopRequested ? " (stopped early)" : ""}`;
     progressWrap.style.display = "none";
     progressBar.style.width = "100%";
-    exportBtn.disabled = all.length === 0;
+    exportBtn.disabled = deduped.length === 0;
     goBtn.disabled = false;
     stopBtn.disabled = true;
 
-    for (const m of all) renderResult(m);
+    for (const m of deduped) renderResult(m);
   };
 
   // CSV export (local file download only, no network requests)
