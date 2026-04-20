@@ -799,10 +799,11 @@
 
         const data = await res.json();
 
-        const bodyIndicatesIndexing = data.indexing
-          || (offset === 0 && !maxIdCursor && data.total_results === 0
-              && data.analytics_id && !(data.messages?.length));
-        if (bodyIndicatesIndexing) {
+        // Only treat an explicit `indexing: true` flag as "still indexing".
+        // Do NOT infer indexing from empty results - a legitimate zero-hit
+        // search also returns total_results=0 with an analytics_id, and the
+        // old heuristic caused infinite retry loops on those.
+        if (data.indexing === true) {
           indexRetries++;
           if (indexRetries > MAX_INDEX_RETRIES) {
             console.warn(`[xsearch] ${g.name} still indexing after ${MAX_INDEX_RETRIES} retries, skipping`);
