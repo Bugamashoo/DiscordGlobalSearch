@@ -480,7 +480,7 @@
     <div id="xsearch-header">
       <strong>Cross-Server Search</strong>
       <div id="xsearch-header-actions">
-        <button id="xsearch-toggle">Min</button>
+        <button id="xsearch-toggle">Minimize Window</button>
         <button id="xsearch-close">Close</button>
       </div>
       <div id="xsearch-header-progress"><div id="xsearch-header-progress-bar"></div></div>
