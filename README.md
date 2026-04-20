@@ -7,6 +7,14 @@ Discord's built-in search only works on one server at a time. This script loops 
 ## **DISCLAIMER:**
 **Pasting a script into a javascript console is INHERENTLY RISKY. I wrote this script as a helpful tool but you should always verify the content of scripts just in case.**
 
+## Table of Contents
+- [Risks](#please-read-about-the-risks-first)
+- [Features](#features)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Troubleshooting](#troubleshooting)
+- [FAQ](#faq)
+
 ---
 
 ## PLEASE Read about the risks first:
