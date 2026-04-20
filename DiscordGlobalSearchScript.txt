@@ -251,10 +251,17 @@
     return vals.slice(0, Math.min(3, vals.length)).every(looksLikeGuild);
   };
 
+  const getGuildIconUrl = (guild) => {
+    const icon = guild?.icon ?? guild?.iconHash ?? guild?.iconId;
+    if (!guild?.id || !icon) return "";
+    const ext = String(icon).startsWith("a_") ? "gif" : "png";
+    return `https://cdn.discordapp.com/icons/${guild.id}/${icon}.${ext}?size=64`;
+  };
+
   const extractGuildList = (obj) =>
     Object.values(obj)
       .filter(v => v?.id && v?.name)
-      .map(v => ({ id: v.id, name: v.name }));
+      .map(v => ({ id: v.id, name: v.name, iconUrl: getGuildIconUrl(v) }));
 
   const getGuilds = () => {
     // 1. name-based fast path
@@ -279,6 +286,31 @@
       } catch (e) {}
     }
     return [];
+  };
+
+  const parseCssUrl = (value) => {
+    const match = String(value ?? "").match(/url\((['"]?)(.*?)\1\)/);
+    return match?.[2] ?? "";
+  };
+
+  const getSidebarGuildIcons = () => {
+    const icons = new Map();
+    document.querySelectorAll('a[href^="/channels/"]').forEach(link => {
+      const href = link.getAttribute("href") || "";
+      const match = href.match(/^\/channels\/([^/]+)/);
+      const guildId = match?.[1];
+      if (!guildId || guildId === "@me" || icons.has(guildId)) return;
+      const img = link.querySelector("img");
+      const src = img?.currentSrc || img?.src || "";
+      if (src) {
+        icons.set(guildId, src);
+        return;
+      }
+      const bgNode = link.querySelector('[style*="background-image"]');
+      const bg = parseCssUrl(bgNode?.style?.backgroundImage);
+      if (bg) icons.set(guildId, bg);
+    });
+    return icons;
   };
 
   // Generic module finder used for navigation lookups below.
@@ -355,23 +387,30 @@
   // Token is scoped to this IIFE and only ever sent as the Authorization header to discord.com search endpoints.
   let token = getToken();
 
-  const guilds = getGuilds().sort((a, b) => a.name.localeCompare(b.name));
+  const sidebarGuildIcons = getSidebarGuildIcons();
+  const guilds = getGuilds()
+    .map(g => ({ ...g, iconUrl: sidebarGuildIcons.get(g.id) || g.iconUrl || "" }))
+    .sort((a, b) => a.name.localeCompare(b.name));
   if (guilds.length === 0) { console.error("[xsearch] Found 0 guilds."); return; }
   if (!token) console.warn("[xsearch] Token not found via webpack; will retry at search time via network capture.");
   console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel || fluxDispatcher)}, api=${API_BASE}, stealthHeaders=${Object.keys(_capturedHeaders).length}`);
 
   // Injected via CSSStyleSheet (avoids style-src unsafe-inline CSP restrictions); falls back to a <style> element.
   const CSS_TEXT = `
-    #xsearch-overlay { position: fixed; top: 50px; right: 50px; width: 760px; max-width: 90vw; background: #2b2d31; color: #dbdee1; border: 1px solid #1e1f22; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 99999; font-family: system-ui, sans-serif; display: flex; flex-direction: column; }
+    #xsearch-overlay { position: fixed; top: 50px; right: 50px; width: 760px; max-width: 90vw; background: #2b2d31; color: #dbdee1; border: 1px solid #1e1f22; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 99999; font-family: system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden; transition: height 220ms ease, transform 220ms ease, opacity 200ms ease; }
     #xsearch-overlay.expanded { height: 750px; max-height: 88vh; }
-    #xsearch-header { padding: 10px 14px; background: #1e1f22; cursor: move; display: flex; justify-content: space-between; align-items: center; user-select: none; border-radius: 8px 8px 0 0; }
+    #xsearch-overlay.minimized { height: 40px; }
+    #xsearch-header { padding: 10px 14px; background: #1e1f22; cursor: move; display: flex; justify-content: space-between; align-items: center; user-select: none; border-radius: 8px 8px 0 0; position: relative; flex-shrink: 0; }
     #xsearch-overlay:not(.expanded) #xsearch-header { border-radius: 8px; }
     #xsearch-header strong { font-size: 14px; }
     #xsearch-header-actions { display: flex; gap: 6px; align-items: center; }
+    #xsearch-header-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: rgba(255,255,255,0.06); overflow: hidden; opacity: 0; transition: opacity 200ms ease; pointer-events: none; }
+    #xsearch-header-progress.active { opacity: 1; }
+    #xsearch-header-progress-bar { height: 100%; width: 0%; background: #5865f2; transition: width 0.2s ease; }
     #xsearch-toggle, #xsearch-close { color: #fff; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
     #xsearch-toggle { background: #4e5058; }
     #xsearch-close { background: #ed4245; }
-    #xsearch-body { padding: 14px; overflow-y: auto; flex: 1; }
+    #xsearch-body { padding: 14px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
     #xsearch-overlay:not(.expanded) #xsearch-body { display: none; }
     #xsearch-overlay input[type=text] { width: 100%; padding: 9px 12px; background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
     #xsearch-controls { display: flex; gap: 8px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
@@ -390,17 +429,30 @@
     #xsearch-servers { padding: 8px; max-height: 240px; overflow-y: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
     #xsearch-servers label { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 4px; cursor: pointer; color: #dbdee1; transition: background 0.1s; min-width: 0; }
     #xsearch-servers label:hover { background: #2b2d31; }
-    #xsearch-servers label span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #xsearch-servers .server-icon { width: 20px; height: 20px; border-radius: 50%; object-fit: cover; flex-shrink: 0; background: #3f4147; }
+    #xsearch-servers .server-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
     #xsearch-servers input[type=checkbox] { appearance: none; width: 16px; height: 16px; border: 1.5px solid #4e5058; border-radius: 3px; background: #2b2d31; cursor: pointer; flex-shrink: 0; position: relative; }
     #xsearch-servers input[type=checkbox]:checked { background: #5865f2; border-color: #5865f2; }
     #xsearch-servers input[type=checkbox]:checked::after { content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
     #xsearch-status { font-size: 12px; color: #b5bac1; margin: 8px 0; }
     #xsearch-progress-wrap { background: #1e1f22; border-radius: 4px; height: 14px; margin: 6px 0; overflow: hidden; display: none; }
     #xsearch-progress-bar { background: #5865f2; height: 100%; width: 0%; transition: width 0.2s ease; }
+    #xsearch-sort-row { display: none; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; font-size: 12px; color: #b5bac1; }
+    #xsearch-sort-row.visible { display: flex; }
+    #xsearch-sort-row select { background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; font-size: 12px; }
+    #xsearch-secondary-wrap { display: none; align-items: center; gap: 6px; }
+    #xsearch-secondary-wrap.visible { display: flex; }
+    #xsearch-overlay .group-header { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #b5bac1; font-weight: 600; padding: 10px 4px 4px; margin-top: 8px; border-bottom: 1px solid #2b2d31; }
+    #xsearch-overlay .group-header .count { color: #5865f2; margin-left: 6px; font-weight: 500; }
     #xsearch-overlay .msg { background: #313338; padding: 10px; border-radius: 4px; margin: 6px 0; cursor: pointer; border-left: 3px solid #5865f2; }
     #xsearch-overlay .msg:hover { background: #383a40; }
     #xsearch-overlay .msg .meta { font-size: 11px; color: #b5bac1; margin-bottom: 4px; }
     #xsearch-overlay .msg .content { font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+    #xsearch-launcher { position: fixed; bottom: 96px; right: 24px; width: 52px; height: 52px; background: #5865f2; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,0.5); z-index: 99999; font-size: 26px; user-select: none; opacity: 0; transform: scale(0); pointer-events: none; transition: transform 220ms ease, opacity 200ms ease, box-shadow 200ms ease; }
+    #xsearch-launcher.visible { opacity: 1; transform: scale(1); pointer-events: auto; }
+    #xsearch-launcher:hover { box-shadow: 0 6px 22px rgba(88,101,242,0.7); }
+    #xsearch-launcher.searching { animation: xsearch-pulse 1.6s ease-in-out infinite; }
+    @keyframes xsearch-pulse { 0%,100% { box-shadow: 0 4px 16px rgba(88,101,242,0.5); } 50% { box-shadow: 0 4px 28px rgba(88,101,242,1); } }
   `;
 
   let _removeStyles = null;
@@ -419,6 +471,7 @@
 
   // Overlay UI
   document.getElementById("xsearch-overlay")?.remove();
+  document.getElementById("xsearch-launcher")?.remove();
   _removeStyles?.();
 
   const overlay = document.createElement("div");
@@ -427,9 +480,10 @@
     <div id="xsearch-header">
       <strong>Cross-Server Search</strong>
       <div id="xsearch-header-actions">
-        <button id="xsearch-toggle">Hide</button>
+        <button id="xsearch-toggle">Min</button>
         <button id="xsearch-close">Close</button>
       </div>
+      <div id="xsearch-header-progress"><div id="xsearch-header-progress-bar"></div></div>
     </div>
     <div id="xsearch-body">
       <input id="xsearch-q" type="text" placeholder="Search query..." />
@@ -460,12 +514,39 @@
       </div>
       <div id="xsearch-status"></div>
       <div id="xsearch-progress-wrap"><div id="xsearch-progress-bar"></div></div>
+      <div id="xsearch-sort-row">
+        <label for="xsearch-sort-primary">Sort:</label>
+        <select id="xsearch-sort-primary">
+          <option value="newest" selected>Newest</option>
+          <option value="oldest">Oldest</option>
+          <option value="az">A-Z</option>
+          <option value="server-latest">Server (Latest)</option>
+          <option value="server-az">Server (A-Z)</option>
+          <option value="user-latest">User (Latest)</option>
+          <option value="user-az">User (A-Z)</option>
+        </select>
+        <span id="xsearch-secondary-wrap">
+          <label for="xsearch-sort-secondary">Within group:</label>
+          <select id="xsearch-sort-secondary">
+            <option value="newest" selected>Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="az">A-Z</option>
+          </select>
+        </span>
+      </div>
       <div id="xsearch-results"></div>
     </div>
   `;
   overlay.classList.add("expanded");
   _removeStyles = injectStyles(CSS_TEXT);
   document.body.appendChild(overlay);
+
+  document.getElementById("xsearch-launcher")?.remove();
+  const launcher = document.createElement("div");
+  launcher.id = "xsearch-launcher";
+  launcher.title = "Open Cross-Server Search";
+  launcher.textContent = "🔍";
+  document.body.appendChild(launcher);
 
   // Restore previous overlay position, clamped to viewport bounds to prevent orphaning.
   const POS_KEY = "xsearch_pos_v1";
@@ -486,27 +567,62 @@
     } catch (e) {}
   };
 
+  let overlayState = "expanded";
+  let preDockState = "expanded";
+
+  const setOverlayState = (next) => {
+    if (next === overlayState) return;
+    const toggleBtn = overlay.querySelector("#xsearch-toggle");
+    if (next === "docked") {
+      if (overlayState === "expanded" || overlayState === "minimized") preDockState = overlayState;
+      const r = overlay.getBoundingClientRect();
+      launcher.classList.add("visible");
+      requestAnimationFrame(() => {
+        const lr = launcher.getBoundingClientRect();
+        const dx = (lr.left + lr.width / 2) - (r.left + r.width / 2);
+        const dy = (lr.top + lr.height / 2) - (r.top + r.height / 2);
+        overlay.style.transformOrigin = "center center";
+        overlay.style.transform = `translate(${dx}px, ${dy}px) scale(0.05)`;
+        overlay.style.opacity = "0";
+        overlay.style.pointerEvents = "none";
+        overlay.classList.add("docked");
+      });
+    } else if (next === "expanded" || next === "minimized") {
+      overlay.classList.remove("docked");
+      overlay.style.transform = "";
+      overlay.style.opacity = "";
+      overlay.style.pointerEvents = "";
+      if (next === "expanded") {
+        overlay.classList.add("expanded");
+        overlay.classList.remove("minimized");
+        if (toggleBtn) toggleBtn.textContent = "Min";
+      } else {
+        overlay.classList.add("minimized");
+        overlay.classList.remove("expanded");
+        if (toggleBtn) toggleBtn.textContent = "Show";
+      }
+      launcher.classList.remove("visible");
+    }
+    overlayState = next;
+  };
+
+  launcher.onclick = () => setOverlayState(preDockState || "expanded");
+
   const onKeyDown = (e) => {
     if (e.key === "Escape" && document.body.contains(overlay)) {
       if (overlay.contains(document.activeElement) || document.activeElement === document.body) {
-        closeOverlay();
+        if (overlayState !== "docked") setOverlayState("docked");
       }
     }
   };
   document.addEventListener("keydown", onKeyDown);
-
-  const closeOverlay = () => {
-    stopRequested = true;
-    document.removeEventListener("keydown", onKeyDown);
-    _removeStyles?.();
-    overlay.remove();
-  };
 
   // Drag handling
   const header = overlay.querySelector("#xsearch-header");
   let dragging = false, dx = 0, dy = 0, dragMoved = false;
   header.addEventListener("mousedown", e => {
     if (e.target.tagName === "BUTTON") return;
+    if (overlayState !== "expanded" && overlayState !== "minimized") return;
     dragging = true;
     dragMoved = false;
     const rect = overlay.getBoundingClientRect();
@@ -529,33 +645,45 @@
   header.addEventListener("click", e => {
     if (e.target.tagName === "BUTTON") return;
     if (dragMoved) return;
-    overlay.classList.toggle("expanded");
-    overlay.querySelector("#xsearch-toggle").textContent = overlay.classList.contains("expanded") ? "Hide" : "Show";
+    setOverlayState(overlayState === "expanded" ? "minimized" : "expanded");
   });
 
   overlay.querySelector("#xsearch-toggle").onclick = (e) => {
     e.stopPropagation();
-    overlay.classList.toggle("expanded");
-    e.target.textContent = overlay.classList.contains("expanded") ? "Hide" : "Show";
+    setOverlayState(overlayState === "expanded" ? "minimized" : "expanded");
   };
   overlay.querySelector("#xsearch-close").onclick = (e) => {
     e.stopPropagation();
-    closeOverlay();
+    setOverlayState("docked");
   };
-
-  const escapeHtml = (s) => String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 
   const serversDiv = overlay.querySelector("#xsearch-servers");
   guilds.forEach(g => {
     const lbl = document.createElement("label");
-    const safeName = escapeHtml(g.name);
-    const safeId = escapeHtml(g.id);
-    lbl.innerHTML = `<input type="checkbox" data-id="${safeId}" checked><span title="${safeName}">${safeName}</span>`;
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.dataset.id = g.id;
+    checkbox.checked = true;
+    lbl.appendChild(checkbox);
+
+    if (g.iconUrl) {
+      const icon = document.createElement("img");
+      icon.className = "server-icon";
+      icon.alt = "";
+      icon.src = g.iconUrl;
+      icon.loading = "lazy";
+      icon.decoding = "async";
+      icon.referrerPolicy = "no-referrer";
+      icon.draggable = false;
+      icon.addEventListener("error", () => icon.remove(), { once: true });
+      lbl.appendChild(icon);
+    }
+
+    const name = document.createElement("span");
+    name.className = "server-name";
+    name.title = g.name;
+    name.textContent = g.name;
+    lbl.appendChild(name);
     serversDiv.appendChild(lbl);
   });
 
@@ -629,6 +757,85 @@
     div.appendChild(content);
     div.onclick = () => jumpToMessage(m._guildId, m.channel_id, m.id);
     results.appendChild(div);
+  };
+
+  const computeOrdered = (items, primary, secondary) => {
+    const cmpNewest = (a, b) => new Date(b.timestamp) - new Date(a.timestamp);
+    const cmpOldest = (a, b) => new Date(a.timestamp) - new Date(b.timestamp);
+    const cmpAZ = (a, b) => (a.content || "").toLowerCase().localeCompare((b.content || "").toLowerCase());
+    const withinTable = { newest: cmpNewest, oldest: cmpOldest, az: cmpAZ };
+    const within = withinTable[secondary] || cmpNewest;
+
+    if (primary === "newest") return [{ key: null, label: null, items: [...items].sort(cmpNewest) }];
+    if (primary === "oldest") return [{ key: null, label: null, items: [...items].sort(cmpOldest) }];
+    if (primary === "az") return [{ key: null, label: null, items: [...items].sort(cmpAZ) }];
+
+    const isUser = primary.startsWith("user");
+    const isAZ = primary.endsWith("-az");
+    const buckets = new Map();
+    for (const m of items) {
+      const k = isUser ? (m.author?.id ?? "_unknown") : m._guildId;
+      const label = isUser ? (m.author?.username || "Unknown user") : (m._guildName || "Unknown server");
+      let b = buckets.get(k);
+      if (!b) { b = { key: k, label, items: [], maxTs: -Infinity }; buckets.set(k, b); }
+      b.items.push(m);
+      const ts = +new Date(m.timestamp);
+      if (ts > b.maxTs) b.maxTs = ts;
+    }
+    const groups = [...buckets.values()];
+    if (isAZ) groups.sort((a, b) => a.label.toLowerCase().localeCompare(b.label.toLowerCase()));
+    else groups.sort((a, b) => b.maxTs - a.maxTs);
+    for (const g of groups) g.items.sort(within);
+    return groups;
+  };
+
+  let _renderToken = 0;
+  const renderResults = () => {
+    const results = overlay.querySelector("#xsearch-results");
+    const sortRow = overlay.querySelector("#xsearch-sort-row");
+    const secondaryWrap = overlay.querySelector("#xsearch-secondary-wrap");
+    results.innerHTML = "";
+    if (!lastResults.length) {
+      sortRow.classList.remove("visible");
+      return;
+    }
+    sortRow.classList.add("visible");
+    const primary = overlay.querySelector("#xsearch-sort-primary").value;
+    const secondary = overlay.querySelector("#xsearch-sort-secondary").value;
+    const grouped = primary.startsWith("server") || primary.startsWith("user");
+    secondaryWrap.classList.toggle("visible", grouped);
+
+    const groups = computeOrdered(lastResults, primary, secondary);
+    const queue = [];
+    for (const g of groups) {
+      if (grouped) queue.push({ header: g.label, count: g.items.length });
+      for (const m of g.items) queue.push({ msg: m });
+    }
+    const myToken = ++_renderToken;
+    let i = 0;
+    const renderChunk = () => {
+      if (myToken !== _renderToken) return;
+      const end = Math.min(queue.length, i + 50);
+      for (; i < end; i++) {
+        const it = queue[i];
+        if ("header" in it) {
+          const h = document.createElement("div");
+          h.className = "group-header";
+          const label = document.createElement("span");
+          label.textContent = it.header;
+          const count = document.createElement("span");
+          count.className = "count";
+          count.textContent = `(${it.count})`;
+          h.appendChild(label);
+          h.appendChild(count);
+          results.appendChild(h);
+        } else {
+          renderResult(it.msg);
+        }
+      }
+      if (i < queue.length) requestAnimationFrame(renderChunk);
+    };
+    renderChunk();
   };
 
   // Discord caps the search 'offset' parameter at 5000; above that we switch to max_id cursor pagination.
@@ -885,6 +1092,8 @@
     const results = overlay.querySelector("#xsearch-results");
     const progressWrap = overlay.querySelector("#xsearch-progress-wrap");
     const progressBar = overlay.querySelector("#xsearch-progress-bar");
+    const headerProgress = overlay.querySelector("#xsearch-header-progress");
+    const headerProgressBar = overlay.querySelector("#xsearch-header-progress-bar");
     const exportBtn = overlay.querySelector("#xsearch-export");
     const goBtn = overlay.querySelector("#xsearch-go");
     const stopBtn = overlay.querySelector("#xsearch-stop");
@@ -892,8 +1101,12 @@
     const concurrency = Math.max(1, Math.min(5, parseInt(concurrencyInput?.value ?? "2", 10) || 2));
 
     results.innerHTML = "";
+    overlay.querySelector("#xsearch-sort-row").classList.remove("visible");
     progressWrap.style.display = "block";
     progressBar.style.width = "0%";
+    headerProgressBar.style.width = "0%";
+    headerProgress.classList.add("active");
+    launcher.classList.add("searching");
     exportBtn.disabled = true;
     goBtn.disabled = true;
     stopBtn.disabled = false;
@@ -901,18 +1114,22 @@
     hardKill = false;
     lastResults = [];
 
-    if (!token) {
-      status.textContent = "Error: could not retrieve auth token. Open any channel in Discord then click Search again.";
+    const finishSearchUi = () => {
+      progressWrap.style.display = "none";
+      headerProgress.classList.remove("active");
+      launcher.classList.remove("searching");
       goBtn.disabled = false;
       stopBtn.disabled = true;
-      progressWrap.style.display = "none";
+    };
+
+    if (!token) {
+      status.textContent = "Error: could not retrieve auth token. Open any channel in Discord then click Search again.";
+      finishSearchUi();
       return;
     }
     if (checked.length === 0) {
       status.textContent = "Select at least one server.";
-      goBtn.disabled = false;
-      stopBtn.disabled = true;
-      progressWrap.style.display = "none";
+      finishSearchUi();
       return;
     }
 
@@ -925,7 +1142,9 @@
       let sum = completedServers;
       for (const f of serverProgress.values()) sum += Math.min(1, f);
       const pct = (sum / total) * 100;
-      progressBar.style.width = `${Math.min(100, pct)}%`;
+      const w = `${Math.min(100, pct)}%`;
+      progressBar.style.width = w;
+      headerProgressBar.style.width = w;
     };
 
     const renderStatus = (extra = "") => {
@@ -975,28 +1194,23 @@
       seenIds.add(m.id);
       deduped.push(m);
     }
-    deduped.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    deduped.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     lastResults = deduped;
 
     let finalNote = "";
     if (hardKill) finalNote = " (HALTED: token rejected or account flagged - re-inject script)";
     else if (stopRequested) finalNote = " (stopped early)";
     status.textContent = `${deduped.length} total results across ${total} servers${finalNote}`;
-    progressWrap.style.display = "none";
     progressBar.style.width = "100%";
+    headerProgressBar.style.width = "100%";
     exportBtn.disabled = deduped.length === 0;
-    goBtn.disabled = false;
-    stopBtn.disabled = true;
+    finishSearchUi();
 
-    // Render in batches via requestAnimationFrame to avoid locking the UI thread on large result sets.
-    let i = 0;
-    const renderChunk = () => {
-      const end = Math.min(deduped.length, i + 50);
-      for (; i < end; i++) renderResult(deduped[i]);
-      if (i < deduped.length) requestAnimationFrame(renderChunk);
-    };
-    renderChunk();
+    renderResults();
   };
+
+  overlay.querySelector("#xsearch-sort-primary").onchange = renderResults;
+  overlay.querySelector("#xsearch-sort-secondary").onchange = renderResults;
 
   // CSV export (local file download only, no network requests)
   const csvEscape = (v) => {
@@ -1060,4 +1274,34 @@
       overlay.querySelector("#xsearch-go").click();
     }
   });
+
+  const closeDevToolsIfAvailable = () => {
+    const nativeWindow = window.DiscordNative?.window;
+    if (typeof nativeWindow?.closeDevTools === "function") {
+      nativeWindow.closeDevTools();
+      return true;
+    }
+    if (typeof nativeWindow?.toggleDevTools === "function") {
+      const isOpen = typeof nativeWindow.isDevToolsOpened === "function"
+        ? nativeWindow.isDevToolsOpened()
+        : true;
+      if (isOpen) {
+        nativeWindow.toggleDevTools();
+        return true;
+      }
+    }
+
+    if (typeof window.DiscordNative?.closeDevTools === "function") {
+      window.DiscordNative.closeDevTools();
+      return true;
+    }
+    if (typeof window.DiscordNative?.toggleDevTools === "function") {
+      window.DiscordNative.toggleDevTools();
+      return true;
+    }
+
+    return false;
+  };
+
+  setTimeout(closeDevToolsIfAvailable, 0);
 })();
