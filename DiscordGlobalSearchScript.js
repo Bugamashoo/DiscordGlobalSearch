@@ -474,13 +474,25 @@
   document.getElementById("xsearch-launcher")?.remove();
   _removeStyles?.();
 
+  const TIME_RANGE_OPTIONS = [
+    { label: "Any time",     ms: 0 },
+    { label: "Past hour",    ms: 3_600_000 },
+    { label: "Past 6 hours", ms: 21_600_000 },
+    { label: "Past day",     ms: 86_400_000 },
+    { label: "Past 3 days",  ms: 259_200_000 },
+    { label: "Past week",    ms: 604_800_000 },
+    { label: "Past month",   ms: 2_592_000_000 },
+    { label: "Past year",    ms: 31_536_000_000 },
+    { label: "Past 2 years", ms: 63_072_000_000 },
+  ];
+
   const overlay = document.createElement("div");
   overlay.id = "xsearch-overlay";
   overlay.innerHTML = `
     <div id="xsearch-header">
       <strong>Cross-Server Search</strong>
       <div id="xsearch-header-actions">
-        <button id="xsearch-toggle">Minimize Window</button>
+        <button id="xsearch-toggle">Min</button>
         <button id="xsearch-close">Close</button>
       </div>
       <div id="xsearch-header-progress"><div id="xsearch-header-progress-bar"></div></div>
@@ -499,6 +511,12 @@
             <option value="3">3</option>
             <option value="4">4</option>
             <option value="5">5 (fastest)</option>
+          </select>
+        </span>
+        <span class="ctl-group">
+          <label for="xsearch-timerange">Time range</label>
+          <select id="xsearch-timerange">
+            ${TIME_RANGE_OPTIONS.map(o => `<option value="${o.ms}"${o.ms === 0 ? " selected" : ""}>${o.label}</option>`).join("\n            ")}
           </select>
         </span>
       </div>
@@ -718,6 +736,16 @@
   // 3 consecutive 429s on the same guild usually indicates a behavior-flag rate limit, not a normal bucket reset.
   const MAX_CONSECUTIVE_429 = 3;
 
+  // Discord Snowflake epoch (2015-01-01T00:00:00Z). Used to convert timestamps to Snowflake IDs for search date filtering.
+  const DISCORD_EPOCH = 1420070400000n;
+
+  const tsToSnowflake = (ms) => String((BigInt(Math.max(0, ms)) - DISCORD_EPOCH) << 22n);
+
+  // Applies time-range constraints to URLSearchParams. If Discord adds or renames date filter parameters, update only this function.
+  const buildTimeRangeParams = (minId, params) => {
+    if (minId) params.set("min_id", minId);
+  };
+
   // Highlights matching query terms in result content so the user can see why each result matched.
   const highlightInto = (parent, text, query) => {
     parent.textContent = "";
@@ -899,7 +927,7 @@
     await Promise.all(workers);
   };
 
-  const searchOneGuild = async (g, query, onPage) => {
+  const searchOneGuild = async (g, query, onPage, rangeMs = 0) => {
     let offset = 0;
     let maxIdCursor = null;
     let oldestIdSeenInBucket = null;
@@ -909,6 +937,8 @@
     let indexRetries = 0;
     let consecutive429 = 0;
     const found = [];
+    // Anchor the time window to search start so it stays fixed across all pages of this guild.
+    const minId = rangeMs > 0 ? tsToSnowflake(Date.now() - rangeMs) : null;
 
     while (true) {
       if (stopRequested || hardKill) return found;
@@ -918,6 +948,7 @@
         const params = new URLSearchParams({ content: query, include_nsfw: "true" });
         if (maxIdCursor) params.set("max_id", maxIdCursor);
         else params.set("offset", String(offset));
+        buildTimeRangeParams(minId, params);
         const url = `${API_BASE}/guilds/${g.id}/messages/search?${params.toString()}`;
         const res = await fetch(url, {
           headers: buildSearchHeaders(),
@@ -1068,6 +1099,7 @@
           if (oldestIdSeenInBucket === maxIdCursor) return found;
           maxIdCursor = oldestIdSeenInBucket;
           oldestIdSeenInBucket = null;
+          if (minId && BigInt(maxIdCursor) <= BigInt(minId)) return found;
         }
         serverPage++;
 
@@ -1099,6 +1131,7 @@
     const stopBtn = overlay.querySelector("#xsearch-stop");
     const concurrencyInput = overlay.querySelector("#xsearch-concurrency");
     const concurrency = Math.max(1, Math.min(5, parseInt(concurrencyInput?.value ?? "2", 10) || 2));
+    const rangeMs = parseInt(overlay.querySelector("#xsearch-timerange")?.value ?? "0", 10) || 0;
 
     results.innerHTML = "";
     overlay.querySelector("#xsearch-sort-row").classList.remove("visible");
@@ -1173,7 +1206,7 @@
         } else if (evt.kind === "indexing") {
           renderStatus(`${evt.guild} indexing (attempt ${evt.attempt})`);
         }
-      });
+      }, rangeMs);
 
       for (const m of found) all.push(m);
       serverProgress.delete(g.id);
