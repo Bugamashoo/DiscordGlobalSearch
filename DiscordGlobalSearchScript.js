@@ -1,17 +1,12 @@
 (() => {
+  // Clean up any previous injection's network patches before capturing originals.
+  window.__xsearch_restore?.();
+
   // Patches fetch and XHR to passively capture the auth token, API version, and client metadata headers from Discord's own outgoing requests. Self-restores once enough data is collected.
   let _capturedToken = null;
   let _capturedApiVersion = null;
   // Replaying these on our requests makes them look identical to normal Discord UI traffic.
   const _capturedHeaders = {};
-  // Only grab the metadata headers Discord sends; skip anything the browser manages itself.
-  const _stealthHeaderAllow = new Set([
-    "x-super-properties",
-    "x-discord-locale",
-    "x-discord-timezone",
-    "x-debug-options",
-    "x-discord-react-locale",
-  ]);
   const _origFetch = window.fetch;
   const _origXHROpen = XMLHttpRequest.prototype.open;
   const _origXHRSetHeader = XMLHttpRequest.prototype.setRequestHeader;
@@ -21,7 +16,9 @@
     window.fetch = _origFetch;
     XMLHttpRequest.prototype.open = _origXHROpen;
     XMLHttpRequest.prototype.setRequestHeader = _origXHRSetHeader;
+    window.__xsearch_restore = null;
   };
+  window.__xsearch_restore = _restoreNet;
 
   const _maybeRestore = () => {
     // Stop intercepting once we have what we need - minimizes the time spent patching native APIs.
@@ -33,7 +30,8 @@
   const _saveHeader = (name, value) => {
     if (!name || value == null) return;
     const lower = String(name).toLowerCase();
-    if (!_stealthHeaderAllow.has(lower)) return;
+    // Capture all x- prefixed custom headers from Discord API requests; skip authorization (handled separately).
+    if (!lower.startsWith("x-") || lower === "authorization") return;
     if (!_capturedHeaders[lower]) _capturedHeaders[lower] = String(value);
   };
 
@@ -288,6 +286,29 @@
     return [];
   };
 
+  const getFolderData = () => {
+    for (const exp of _candidates) {
+      try {
+        if (typeof exp.getGuildFolders === "function") {
+          const folders = exp.getGuildFolders();
+          if (Array.isArray(folders) && folders.length > 0) return folders;
+        }
+      } catch (e) {}
+    }
+    for (const exp of _candidates) {
+      try {
+        const arr = exp.guildFolders ?? exp.sortedGuildFolders;
+        if (Array.isArray(arr) && arr.length > 0) return arr;
+      } catch (e) {}
+    }
+    return null;
+  };
+
+  const folderColorToCss = (color) => {
+    if (!color) return null;
+    return "#" + (color >>> 0).toString(16).padStart(6, "0");
+  };
+
   const parseCssUrl = (value) => {
     const match = String(value ?? "").match(/url\((['"]?)(.*?)\1\)/);
     return match?.[2] ?? "";
@@ -388,12 +409,71 @@
   let token = getToken();
 
   const sidebarGuildIcons = getSidebarGuildIcons();
+  const _rawFolders = getFolderData();
+
+  // Build a flat position map from folder data (sidebar top-to-bottom order).
+  // Each rawFolders entry is in sidebar order; guildIds within each entry is in folder-internal order.
+  const _navOrder = (() => {
+    const m = new Map();
+    if (!_rawFolders) return m;
+    let pos = 0;
+    for (const entry of _rawFolders) {
+      for (const id of (entry.guildIds ?? entry.guild_ids ?? []).map(String)) {
+        if (!m.has(id)) m.set(id, pos++);
+      }
+    }
+    return m;
+  })();
+  const _navPos = (id) => _navOrder.has(id) ? _navOrder.get(id) : Infinity;
+
   const guilds = getGuilds()
     .map(g => ({ ...g, iconUrl: sidebarGuildIcons.get(g.id) || g.iconUrl || "" }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .sort((a, b) => _navPos(a.id) - _navPos(b.id) || a.name.localeCompare(b.name));
   if (guilds.length === 0) { console.error("[xsearch] Found 0 guilds."); return; }
   if (!token) console.warn("[xsearch] Token not found via webpack; will retry at search time via network capture.");
   console.log(`[xsearch] Ready: ${guilds.length} guilds, nav=${!!(transitionTo || selectChannel || fluxDispatcher)}, api=${API_BASE}, stealthHeaders=${Object.keys(_capturedHeaders).length}`);
+
+  const buildOrganizedGuilds = () => {
+    if (!_rawFolders || _rawFolders.length === 0) return null;
+    const guildMap = new Map(guilds.map(g => [g.id, g]));
+    const assignedIds = new Set();
+    const groups = [];
+
+    for (const entry of _rawFolders) {
+      const guildIds = (entry.guildIds ?? entry.guild_ids ?? []).map(String);
+      const folderId = entry.folderId ?? entry.id ?? null;
+      const folderName = entry.folderName ?? entry.name ?? null;
+      const folderColor = entry.folderColor ?? entry.color ?? null;
+
+      // Ungrouped single-guild entries (null folderId): insert inline at their sidebar position.
+      if (!folderId && guildIds.length <= 1) {
+        if (guildIds.length === 1) {
+          const g = guildMap.get(guildIds[0]);
+          if (g) { groups.push({ type: "ungrouped", guilds: [g] }); assignedIds.add(g.id); }
+        }
+        continue;
+      }
+
+      // Use guildIds array order - it reflects the user's folder-internal arrangement.
+      const members = guildIds.map(id => guildMap.get(id)).filter(Boolean);
+      if (members.length === 0) continue;
+
+      groups.push({
+        type: "folder",
+        id: String(folderId),
+        name: folderName || "Group",
+        color: folderColorToCss(folderColor),
+        guilds: members,
+      });
+      for (const g of members) assignedIds.add(g.id);
+    }
+
+    // Any guilds absent from folder data entirely (edge case) go at the end.
+    const remaining = guilds.filter(g => !assignedIds.has(g.id));
+    if (remaining.length > 0) groups.push({ type: "ungrouped", guilds: remaining });
+    return groups.length > 0 ? groups : null;
+  };
+  const organizedGuilds = buildOrganizedGuilds();
 
   // Injected via CSSStyleSheet (avoids style-src unsafe-inline CSP restrictions); falls back to a <style> element.
   const CSS_TEXT = `
@@ -434,6 +514,11 @@
     #xsearch-servers input[type=checkbox] { appearance: none; width: 16px; height: 16px; border: 1.5px solid #4e5058; border-radius: 3px; background: #2b2d31; cursor: pointer; flex-shrink: 0; position: relative; }
     #xsearch-servers input[type=checkbox]:checked { background: #5865f2; border-color: #5865f2; }
     #xsearch-servers input[type=checkbox]:checked::after { content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+    #xsearch-servers input[type=checkbox]:indeterminate { background: #5865f2; border-color: #5865f2; }
+    #xsearch-servers input[type=checkbox]:indeterminate::after { content: ""; position: absolute; left: 3px; top: 6px; width: 8px; height: 2px; background: #fff; transform: none; border: none; }
+    #xsearch-servers .folder-group { grid-column: 1 / -1; }
+    #xsearch-servers .folder-header { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #dbdee1; margin-top: 4px; border-left: 3px solid #4e5058; background: rgba(78,80,88,0.20); }
+    #xsearch-servers .folder-servers { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; padding: 4px 0 4px 12px; }
     #xsearch-status { font-size: 12px; color: #b5bac1; margin: 8px 0; }
     #xsearch-progress-wrap { background: #1e1f22; border-radius: 4px; height: 14px; margin: 6px 0; overflow: hidden; display: none; }
     #xsearch-progress-bar { background: #5865f2; height: 100%; width: 0%; transition: width 0.2s ease; }
@@ -476,14 +561,24 @@
 
   const TIME_RANGE_OPTIONS = [
     { label: "Any time",     ms: 0 },
-    { label: "Past hour",    ms: 3_600_000 },
-    { label: "Past 6 hours", ms: 21_600_000 },
     { label: "Past day",     ms: 86_400_000 },
     { label: "Past 3 days",  ms: 259_200_000 },
     { label: "Past week",    ms: 604_800_000 },
     { label: "Past month",   ms: 2_592_000_000 },
     { label: "Past year",    ms: 31_536_000_000 },
     { label: "Past 2 years", ms: 63_072_000_000 },
+  ];
+
+  const SERVER_DELAY_OPTIONS = [
+    { label: "Instant (unsafe)",         ms: 0 },
+    { label: "1 second",                 ms: 1_000 },
+    { label: "3 seconds",                ms: 3_000 },
+    { label: "5 seconds",                ms: 5_000 },
+    { label: "10 seconds (recommended)", ms: 10_000 },
+    { label: "30 seconds",               ms: 30_000 },
+    { label: "1 minute",                 ms: 60_000 },
+    { label: "5 minutes",                ms: 300_000 },
+    { label: "10 minutes (safest)",      ms: 600_000 },
   ];
 
   const overlay = document.createElement("div");
@@ -517,6 +612,12 @@
           <label for="xsearch-timerange">Time range</label>
           <select id="xsearch-timerange">
             ${TIME_RANGE_OPTIONS.map(o => `<option value="${o.ms}"${o.ms === 0 ? " selected" : ""}>${o.label}</option>`).join("\n            ")}
+          </select>
+        </span>
+        <span class="ctl-group">
+          <label for="xsearch-server-delay" title="How long to wait between searching each server. Higher values are safer but slower.">Server delay</label>
+          <select id="xsearch-server-delay">
+            ${SERVER_DELAY_OPTIONS.map(o => `<option value="${o.ms}"${o.ms === 10_000 ? " selected" : ""}>${o.label}</option>`).join("\n            ")}
           </select>
         </span>
       </div>
@@ -676,7 +777,8 @@
   };
 
   const serversDiv = overlay.querySelector("#xsearch-servers");
-  guilds.forEach(g => {
+
+  const makeServerLabel = (g) => {
     const lbl = document.createElement("label");
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
@@ -702,14 +804,84 @@
     name.title = g.name;
     name.textContent = g.name;
     lbl.appendChild(name);
-    serversDiv.appendChild(lbl);
-  });
+    return lbl;
+  };
+
+  const hexToRgb = (hex) => {
+    const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || "");
+    return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : null;
+  };
+
+  const syncFolderCheckbox = (folderCb, serverCbs) => {
+    const checkedCount = serverCbs.filter(c => c.checked).length;
+    if (checkedCount === 0) { folderCb.checked = false; folderCb.indeterminate = false; }
+    else if (checkedCount === serverCbs.length) { folderCb.checked = true; folderCb.indeterminate = false; }
+    else { folderCb.checked = false; folderCb.indeterminate = true; }
+  };
+
+  if (organizedGuilds) {
+    for (const group of organizedGuilds) {
+      if (group.type === "folder") {
+        const groupDiv = document.createElement("div");
+        groupDiv.className = "folder-group";
+
+        const headerDiv = document.createElement("div");
+        headerDiv.className = "folder-header";
+
+        const folderCb = document.createElement("input");
+        folderCb.type = "checkbox";
+        folderCb.checked = true;
+
+        if (group.color) {
+          const rgb = hexToRgb(group.color);
+          if (rgb) {
+            headerDiv.style.borderLeftColor = group.color;
+            headerDiv.style.backgroundColor = `rgba(${rgb.r},${rgb.g},${rgb.b},0.20)`;
+          }
+        }
+
+        headerDiv.appendChild(folderCb);
+        const folderNameSpan = document.createElement("span");
+        folderNameSpan.textContent = group.name;
+        headerDiv.appendChild(folderNameSpan);
+        groupDiv.appendChild(headerDiv);
+
+        const serversInner = document.createElement("div");
+        serversInner.className = "folder-servers";
+        const serverCbs = [];
+
+        for (const g of group.guilds) {
+          const lbl = makeServerLabel(g);
+          const cb = lbl.querySelector("input[type=checkbox]");
+          serverCbs.push(cb);
+          cb.addEventListener("change", () => syncFolderCheckbox(folderCb, serverCbs));
+          serversInner.appendChild(lbl);
+        }
+
+        folderCb.addEventListener("change", () => {
+          for (const cb of serverCbs) cb.checked = folderCb.checked;
+          folderCb.indeterminate = false;
+        });
+
+        groupDiv.appendChild(serversInner);
+        serversDiv.appendChild(groupDiv);
+      } else {
+        for (const g of group.guilds) {
+          serversDiv.appendChild(makeServerLabel(g));
+        }
+      }
+    }
+  } else {
+    for (const g of guilds) {
+      serversDiv.appendChild(makeServerLabel(g));
+    }
+  }
 
   overlay.querySelector("#xsearch-all").onclick = () => {
-    serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = true);
+    serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => { c.checked = true; c.indeterminate = false; });
   };
   overlay.querySelector("#xsearch-none").onclick = () => {
-    serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => c.checked = false);
+    serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => { c.checked = false; c.indeterminate = false; });
   };
 
   // Search state
@@ -720,16 +892,18 @@
   let hardKill = false;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  // Jitter makes request timing look organic; ±25% is small enough to not materially change throughput.
-  const jitter = (ms, pct = 0.25) => {
-    const variance = ms * pct;
-    return Math.max(0, ms + (Math.random() * 2 - 1) * variance);
+  // Jitter uses a right-skewed distribution to mimic real human browsing behavior:
+  // base spread of ±30%, plus a 15% chance of an extra reading pause of 20-80% of the delay.
+  const jitter = (ms, pct = 0.30) => {
+    if (ms <= 0) return 0;
+    const base = ms + (Math.random() - 0.5) * 2 * ms * pct;
+    const extra = Math.random() < 0.15 ? ms * (0.2 + Math.random() * 0.6) : 0;
+    return Math.max(0, base + extra);
   };
   const jitteredSleep = (ms, pct) => sleep(jitter(ms, pct));
 
   // 2.5s mean per page stays well under Discord's per-guild search bucket (roughly 10 req/5s historically).
   const PAGE_DELAY = 2500;
-  const SERVER_DELAY = 4000;
   const PAGE_SIZE = 25;
   const INDEX_WAIT = 5000;
   const MAX_INDEX_RETRIES = 12;
@@ -903,7 +1077,7 @@
   // Builds headers for search requests. Replays stealth headers captured from real Discord traffic so
   // requests look identical to what the client sends normally.
   const buildSearchHeaders = () => {
-    const h = { Authorization: token }; // token is only sent to discord.com; see fetch() call in searchOneGuild
+    const h = { Authorization: token, Accept: "*/*" }; // token is only sent to discord.com; see fetch() call in searchOneGuild
     for (const [name, value] of Object.entries(_capturedHeaders)) {
       h[name] = value;
     }
@@ -1115,7 +1289,7 @@
     // Re-check token - it may have arrived via network capture after initial load.
     if (!token) token = getToken();
 
-    const checked = [...serversDiv.querySelectorAll("input:checked")].map(i => ({
+    const checked = [...serversDiv.querySelectorAll("input:checked[data-id]")].map(i => ({
       id: i.dataset.id,
       name: i.parentElement.querySelector("span").textContent.trim()
     }));
@@ -1216,7 +1390,8 @@
 
       // Inter-server think pause within a worker, jittered. Skipped on the
       // last item per worker (queue is empty) by virtue of the loop exit.
-      if (!stopRequested && !hardKill) await jitteredSleep(SERVER_DELAY);
+      const serverDelayMs = parseInt(overlay.querySelector("#xsearch-server-delay")?.value ?? "10000", 10) || 0;
+      if (!stopRequested && !hardKill && serverDelayMs > 0) await jitteredSleep(serverDelayMs);
     }, concurrency);
 
     // Dedup by message ID; cursor and offset modes can occasionally return overlapping pages.
