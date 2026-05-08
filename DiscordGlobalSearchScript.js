@@ -484,9 +484,14 @@
     #xsearch-overlay:not(.expanded) #xsearch-header { border-radius: 8px; }
     #xsearch-header strong { font-size: 14px; }
     #xsearch-header-actions { display: flex; gap: 6px; align-items: center; }
-    #xsearch-header-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: rgba(255,255,255,0.06); overflow: hidden; opacity: 0; transition: opacity 200ms ease; pointer-events: none; }
+    #xsearch-header-progress { position: absolute; left: 0; right: 0; top: 0; height: 2px; background: rgba(255,255,255,0.06); overflow: hidden; opacity: 0; transition: opacity 200ms ease; pointer-events: none; }
     #xsearch-header-progress.active { opacity: 1; }
-    #xsearch-header-progress-bar { height: 100%; width: 0%; background: #5865f2; transition: width 0.2s ease; }
+    #xsearch-header-progress-bar { height: 100%; width: 0%; background: #5865f2; transition: width 0.2s ease, background 400ms ease; }
+    #xsearch-header-progress-bar.done { background: #3ba55d; }
+    #xsearch-launcher-ring { position: absolute; top: 0; left: 0; width: 52px; height: 52px; pointer-events: none; opacity: 0; transition: opacity 500ms ease; }
+    #xsearch-launcher-ring.active { opacity: 1; }
+    #xsearch-launcher-ring circle { fill: none; stroke: rgba(255,255,255,0.85); stroke-width: 3; stroke-linecap: round; transition: stroke-dashoffset 0.2s ease, stroke 400ms ease; }
+    #xsearch-launcher-ring.done circle { stroke: #3ba55d; }
     #xsearch-toggle, #xsearch-close { color: #fff; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
     #xsearch-toggle { background: #4e5058; }
     #xsearch-close { background: #ed4245; }
@@ -665,7 +670,37 @@
   launcher.id = "xsearch-launcher";
   launcher.title = "Open Cross-Server Search";
   launcher.textContent = "🔍";
+
+  const RING_CIRC = 2 * Math.PI * 23;
+  const launcherRing = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  launcherRing.id = "xsearch-launcher-ring";
+  launcherRing.setAttribute("viewBox", "0 0 52 52");
+  const ringCircle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  ringCircle.setAttribute("cx", "26");
+  ringCircle.setAttribute("cy", "26");
+  ringCircle.setAttribute("r", "23");
+  ringCircle.setAttribute("transform", "rotate(-90 26 26)");
+  ringCircle.style.strokeDasharray = RING_CIRC;
+  ringCircle.style.strokeDashoffset = RING_CIRC;
+  launcherRing.appendChild(ringCircle);
+  launcher.appendChild(launcherRing);
+
   document.body.appendChild(launcher);
+
+  let ringFadeTimer = null;
+  const fadeRingOut = (delay) => {
+    if (ringFadeTimer) clearTimeout(ringFadeTimer);
+    ringFadeTimer = setTimeout(() => {
+      ringFadeTimer = null;
+      launcherRing.classList.remove("active");
+      setTimeout(() => {
+        launcherRing.classList.remove("done");
+        ringCircle.style.transition = "none";
+        ringCircle.style.strokeDashoffset = RING_CIRC;
+        requestAnimationFrame(() => { ringCircle.style.transition = ""; });
+      }, 550);
+    }, Math.max(0, delay));
+  };
 
   // Restore previous overlay position, clamped to viewport bounds to prevent orphaning.
   const POS_KEY = "xsearch_pos_v1";
@@ -715,6 +750,8 @@
         overlay.classList.add("expanded");
         overlay.classList.remove("minimized");
         if (toggleBtn) toggleBtn.textContent = "Min";
+        // If search is done, hold the green ring until the overlay finishes opening (~220ms), then fade out.
+        fadeRingOut(launcherRing.classList.contains("done") ? 280 : 0);
       } else {
         overlay.classList.add("minimized");
         overlay.classList.remove("expanded");
@@ -1312,7 +1349,14 @@
     progressWrap.style.display = "block";
     progressBar.style.width = "0%";
     headerProgressBar.style.width = "0%";
+    headerProgressBar.classList.remove("done");
     headerProgress.classList.add("active");
+    launcherRing.classList.remove("done");
+    if (ringFadeTimer) { clearTimeout(ringFadeTimer); ringFadeTimer = null; }
+    ringCircle.style.transition = "none";
+    ringCircle.style.strokeDashoffset = RING_CIRC;
+    requestAnimationFrame(() => { ringCircle.style.transition = ""; });
+    launcherRing.classList.add("active");
     launcher.classList.add("searching");
     exportBtn.disabled = true;
     goBtn.disabled = true;
@@ -1321,12 +1365,27 @@
     hardKill = false;
     lastResults = [];
 
-    const finishSearchUi = () => {
+    const finishSearchUi = (success = false) => {
       progressWrap.style.display = "none";
-      headerProgress.classList.remove("active");
       launcher.classList.remove("searching");
       goBtn.disabled = false;
       stopBtn.disabled = true;
+
+      if (success) {
+        headerProgressBar.classList.add("done");
+        launcherRing.classList.add("done");
+        fadeRingOut(700);
+        setTimeout(() => {
+          headerProgress.classList.remove("active");
+          setTimeout(() => {
+            headerProgressBar.classList.remove("done");
+            headerProgressBar.style.width = "0%";
+          }, 600);
+        }, 700);
+      } else {
+        headerProgress.classList.remove("active");
+        fadeRingOut(0);
+      }
     };
 
     if (!token) {
@@ -1352,6 +1411,7 @@
       const w = `${Math.min(100, pct)}%`;
       progressBar.style.width = w;
       headerProgressBar.style.width = w;
+      ringCircle.style.strokeDashoffset = RING_CIRC * (1 - Math.min(1, sum / total));
     };
 
     const renderStatus = (extra = "") => {
@@ -1391,7 +1451,7 @@
       // Inter-server think pause within a worker, jittered. Skipped on the
       // last item per worker (queue is empty) by virtue of the loop exit.
       const serverDelayMs = parseInt(overlay.querySelector("#xsearch-server-delay")?.value ?? "10000", 10) || 0;
-      if (!stopRequested && !hardKill && serverDelayMs > 0) await jitteredSleep(serverDelayMs);
+      if (!stopRequested && !hardKill && serverDelayMs > 0 && completedServers < total) await jitteredSleep(serverDelayMs);
     }, concurrency);
 
     // Dedup by message ID; cursor and offset modes can occasionally return overlapping pages.
@@ -1411,8 +1471,9 @@
     status.textContent = `${deduped.length} total results across ${total} servers${finalNote}`;
     progressBar.style.width = "100%";
     headerProgressBar.style.width = "100%";
+    ringCircle.style.strokeDashoffset = 0;
     exportBtn.disabled = deduped.length === 0;
-    finishSearchUi();
+    finishSearchUi(true);
 
     renderResults();
   };
