@@ -100,8 +100,8 @@ It really should be pretty self-explanatory as all the buttons are labeled clear
 ### Search timing
 
 The script uses intentionally slow delays to avoid spamming Discord's servers:
-- 2 seconds between search pages within a server
-- 4 seconds between searching servers
+- 3 seconds average (randomized) between search pages within a server
+- 10 seconds (by default) between searching servers per parallel thread
 
 A typical search across 20 servers takes 3-8 minutes depending on result counts. Stopping the search prematurely will only display results collected thusfar.
 
