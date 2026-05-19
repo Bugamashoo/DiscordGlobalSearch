@@ -107,8 +107,33 @@
   let _wpRequire = null;
   // Using a string chunk ID instead of Symbol() since newer webpack builds can reject Symbol keys.
   const _wpProbeId = "_xsearch_probe_" + Math.random().toString(36).slice(2);
+
+  // Vencord's live webpack require function. Structurally validated (.c must be an object).
+  // Present in any Vencord-based client (Vesktop, injected Discord, etc.).
+  // If Vencord changes its API path in the future, update only this one spot.
+  const _vcWreq = (() => {
+    try {
+      const w = window.Vencord?.Webpack?.wreq;
+      if (typeof w === "function" && w.c && typeof w.c === "object") return w;
+    } catch (e) {}
+    return null;
+  })();
+
+  // Vencord's webpack Common namespace. Requires at least one known store to be populated
+  // before trusting the object -- guards against a partially-initialized state at inject time.
+  // If Vencord changes its API path in the future, update only this one spot.
+  const _vcCommon = (() => {
+    try {
+      const c = window.Vencord?.Webpack?.Common;
+      if (c && (c.AuthenticationStore || c.GuildStore || c.FluxDispatcher)) return c;
+    } catch (e) {}
+    return null;
+  })();
+
   const wp = () => {
     if (_wpRequire) return _wpRequire;
+    // Vencord/Vesktop: wreq is already captured and exposed; skip the chunk probe entirely.
+    if (_vcWreq) { _wpRequire = _vcWreq; return _wpRequire; }
     const chunk = getWebpackChunk();
     if (!chunk) return null;
     try {
@@ -202,7 +227,14 @@
   const getToken = () => {
     // 1. network capture from the patched fetch/XHR above
     if (_capturedToken) return _capturedToken;
-    // 2. Discord's webpack auth store (holds the token in memory for the session)
+    // 2. Vencord/Vesktop: AuthenticationStore always holds the live session token.
+    if (_vcCommon) {
+      try {
+        const t = _vcCommon.AuthenticationStore?.getToken?.();
+        if (isTokenLike(t)) return t;
+      } catch (e) {}
+    }
+    // 3. Discord's webpack auth store (holds the token in memory for the session)
     for (const exp of _candidates) {
       try {
         if (typeof exp.getToken !== "function") continue;
@@ -210,7 +242,7 @@
         if (isTokenLike(t)) return t;
       } catch (e) {}
     }
-    // 3. localStorage (older Discord builds stored it here)
+    // 4. localStorage (older Discord builds stored it here)
     try {
       const raw = localStorage.getItem("token");
       if (raw) {
@@ -218,7 +250,7 @@
         if (isTokenLike(cleaned)) return cleaned;
       }
     } catch (e) {}
-    // 4. Structural scan: call zero-arg getter-shaped functions and check for a JWT-shaped return value.
+    // 5. Structural scan: call zero-arg getter-shaped functions and check for a JWT-shaped return value.
     const safeFnNameRe = /^(?:get|is|has|fetch|read|peek)|^[a-zA-Z]$/;
     for (const exp of _candidates) {
       try {
@@ -262,6 +294,13 @@
       .map(v => ({ id: v.id, name: v.name, iconUrl: getGuildIconUrl(v) }));
 
   const getGuilds = () => {
+    // Vencord/Vesktop: GuildStore is fully populated by console inject time.
+    if (_vcCommon) {
+      try {
+        const g = _vcCommon.GuildStore?.getGuilds?.();
+        if (isGuildMap(g)) return extractGuildList(g);
+      } catch (e) {}
+    }
     // 1. name-based fast path
     for (const exp of _candidates) {
       try {
@@ -375,14 +414,23 @@
   };
 
   // Flux dispatcher is the last webpack-based fallback; CHANNEL_SELECT drives navigation internally.
-  const getFluxDispatcher = () =>
-    findModule(m =>
+  const getFluxDispatcher = () => {
+    // Vencord/Vesktop: FluxDispatcher is set at startup with a stable interface.
+    if (_vcCommon) {
+      try {
+        const d = _vcCommon.FluxDispatcher;
+        // Validate both dispatch and subscribe to confirm it is a real FluxDispatcher.
+        if (typeof d?.dispatch === "function" && typeof d?.subscribe === "function") return d;
+      } catch (e) {}
+    }
+    return findModule(m =>
       typeof m.dispatch === "function"
       && (typeof m.subscribe === "function" || typeof m._subscriptions === "object")
       && (Array.isArray(m._actionHandlers?._orderedActionHandlers)
           || typeof m.register === "function"
           || typeof m.wait === "function")
     );
+  };
 
   const transitionTo = getTransitionTo();
   const selectChannel = getSelectChannel();
@@ -407,6 +455,87 @@
 
   // Token is scoped to this IIFE and only ever sent as the Authorization header to discord.com search endpoints.
   let token = getToken();
+
+  // --- Current user detection (6-strategy fallback chain) ---
+  // Strategy 1: decode user ID from the auth token. Discord user tokens encode the numeric user ID
+  // as a plain-decimal string in the first base64url segment. This is the most reliable method
+  // since it is derived from a stable token format, not from Discord's UI or webpack internals.
+  const _selfIdFromToken = () => {
+    if (!token) return null;
+    try {
+      const seg = token.split('.')[0];
+      const b64 = seg.replace(/-/g, '+').replace(/_/g, '/');
+      const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+      const decoded = atob(padded);
+      return /^\d{5,}$/.test(decoded.trim()) ? decoded.trim() : null;
+    } catch (e) { return null; }
+  };
+
+  const getSelf = () => {
+    // --- ID ---
+    const id = _selfIdFromToken();
+
+    // --- Username (best-effort; only used for display) ---
+    // Try multiple class-name patterns -- Discord refactors these occasionally.
+    const panel =
+      document.querySelector('[aria-label="User Controls"]') ??
+      document.querySelector('[class*="panels"]');
+    const nameEl = panel
+      ? (panel.querySelector('[class*="username"]') ??
+         panel.querySelector('[class*="nameTag"]') ??
+         panel.querySelector('[class*="name_"]'))
+      : null;
+    const username = nameEl?.textContent?.trim() || null;
+
+    if (id) return { id, username };
+
+    // Strategy 2/3/4: DOM avatar URL -- CDN path pattern is stable.
+    const avatarImg =
+      panel?.querySelector('img[src*="/avatars/"]') ??
+      document.querySelector('[class*="sidebar"] img[src*="/avatars/"]') ??
+      document.querySelector('img[src*="cdn.discordapp.com/avatars/"]');
+    if (avatarImg) {
+      const m = avatarImg.src.match(/\/avatars\/(\d{5,})\//);
+      if (m) return { id: m[1], username };
+    }
+
+    // Strategy 5: webpack named getCurrentUser()
+    for (const exp of _candidates) {
+      try {
+        if (typeof exp.getCurrentUser !== 'function') continue;
+        const user = exp.getCurrentUser();
+        if (user?.id && /^\d{5,}$/.test(String(user.id)))
+          return { id: String(user.id), username: user.username ?? username };
+      } catch (e) {}
+    }
+
+    // Strategy 6: webpack structural scan (same zero-arg getter pattern used in getToken/getGuilds)
+    const _selfFnRe = /^(?:get|is|has|fetch|read|peek)|^[a-zA-Z]$/;
+    for (const exp of _candidates) {
+      try {
+        const fns = Object.keys(exp).filter(k =>
+          typeof exp[k] === 'function' && exp[k].length === 0 && _selfFnRe.test(k)
+        );
+        if (fns.length < 1 || fns.length > 30) continue;
+        for (const key of fns) {
+          const result = exp[key]();
+          if (result && /^\d{5,}$/.test(String(result.id ?? '')) &&
+              typeof result.username === 'string' &&
+              !result.guildId && !Array.isArray(result.features)) {
+            return { id: String(result.id), username: result.username };
+          }
+        }
+      } catch (e) {}
+    }
+
+    return null;
+  };
+
+  const _selfData = getSelf();
+  let selfId = _selfData?.id ?? null;
+  let selfUsername = _selfData?.username ?? null;
+  if (selfId) console.log(`[xsearch] Self detected: id=${selfId}, username=${selfUsername ?? '(unknown)'}`);
+  else console.warn('[xsearch] Could not detect self -- "Hide my messages" filter will be disabled until search time.');
 
   const sidebarGuildIcons = getSidebarGuildIcons();
   const _rawFolders = getFolderData();
@@ -486,7 +615,7 @@
     #xsearch-header-actions { display: flex; gap: 6px; align-items: center; }
     #xsearch-header-progress { position: absolute; left: 0; right: 0; top: 0; height: 2px; background: rgba(255,255,255,0.06); overflow: hidden; opacity: 0; transition: opacity 200ms ease; pointer-events: none; }
     #xsearch-header-progress.active { opacity: 1; }
-    #xsearch-header-progress-bar { height: 100%; width: 0%; background: #5865f2; transition: width 0.2s ease, background 400ms ease; }
+    #xsearch-header-progress-bar { height: 100%; width: 0%; background: #5865f2; transition: width 0.2s ease, background 400ms ease; position: relative; overflow: hidden; }
     #xsearch-header-progress-bar.done { background: #3ba55d; }
     #xsearch-launcher-ring { position: absolute; top: 0; left: 0; width: 52px; height: 52px; pointer-events: none; opacity: 0; transition: opacity 500ms ease; }
     #xsearch-launcher-ring.active { opacity: 1; }
@@ -499,6 +628,8 @@
     #xsearch-overlay:not(.expanded) #xsearch-body { display: none; }
     #xsearch-overlay input[type=text] { width: 100%; padding: 9px 12px; background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
     #xsearch-controls { display: flex; gap: 8px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+    #xsearch-options-row { display: flex; gap: 8px; align-items: center; width: 100%; }
+    #xsearch-options-row .ctl-group { margin-left: 0; }
     #xsearch-overlay .ctl-group { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #b5bac1; margin-left: auto; }
     #xsearch-overlay .ctl-group select { background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; font-size: 12px; }
     #xsearch-overlay .hl { background: #5865f2; color: #fff; padding: 0 2px; border-radius: 2px; }
@@ -526,14 +657,26 @@
     #xsearch-servers .folder-servers { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; padding: 4px 0 4px 12px; }
     #xsearch-status { font-size: 12px; color: #b5bac1; margin: 8px 0; }
     #xsearch-progress-wrap { background: #1e1f22; border-radius: 4px; height: 14px; margin: 6px 0; overflow: hidden; display: none; }
-    #xsearch-progress-bar { background: #5865f2; height: 100%; width: 0%; transition: width 0.2s ease; }
+    #xsearch-progress-bar { background: #5865f2; height: 100%; width: 0%; transition: width 0.2s ease; position: relative; overflow: hidden; }
     #xsearch-sort-row { display: none; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; font-size: 12px; color: #b5bac1; }
     #xsearch-sort-row.visible { display: flex; }
     #xsearch-sort-row select { background: #1e1f22; color: #fff; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; font-size: 12px; }
     #xsearch-secondary-wrap { display: none; align-items: center; gap: 6px; }
     #xsearch-secondary-wrap.visible { display: flex; }
-    #xsearch-overlay .group-header { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #b5bac1; font-weight: 600; padding: 10px 4px 4px; margin-top: 8px; border-bottom: 1px solid #2b2d31; }
-    #xsearch-overlay .group-header .count { color: #5865f2; margin-left: 6px; font-weight: 500; }
+    #xsearch-overlay .group-block { margin-top: 12px; }
+    #xsearch-overlay .group-header { font-size: 15px; font-weight: 700; color: #5865f2; cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px; padding: 8px 4px; border-bottom: 1px solid rgba(88,101,242,0.4); transition: color 120ms ease; }
+    #xsearch-overlay .group-header:hover { color: #818cf8; }
+    #xsearch-overlay .group-header .toggle { font-size: 13px; display: inline-block; transition: transform 180ms ease; transform: rotate(90deg); }
+    #xsearch-overlay .group-block.collapsed .group-header .toggle { transform: rotate(0deg); }
+    #xsearch-overlay .group-header .count { color: #b5bac1; font-weight: 500; font-size: 13px; }
+    .group-cards-wrap { display: grid; grid-template-rows: 1fr; overflow: hidden; }
+    .group-cards { min-height: 0; }
+    .group-block.collapsed .group-cards-wrap { grid-template-rows: 0fr; }
+    .msg.skeleton { pointer-events: none; border-left-color: transparent; }
+    .sk-line { border-radius: 4px; background: linear-gradient(90deg, #3f4147 25%, #4e5058 50%, #3f4147 75%); background-size: 200% 100%; margin-bottom: 6px; }
+    .sk-line-meta { height: 10px; width: 60%; margin-bottom: 8px; }
+    .sk-line-content { height: 14px; width: 90%; }
+    .sk-line.sk-short { width: 45%; }
     #xsearch-overlay .msg { background: #313338; padding: 10px; border-radius: 4px; margin: 6px 0; cursor: pointer; border-left: 3px solid #5865f2; }
     #xsearch-overlay .msg:hover { background: #383a40; }
     #xsearch-overlay .msg .meta { font-size: 11px; color: #b5bac1; margin-bottom: 4px; }
@@ -543,6 +686,36 @@
     #xsearch-launcher:hover { box-shadow: 0 6px 22px rgba(88,101,242,0.7); }
     #xsearch-launcher.searching { animation: xsearch-pulse 1.6s ease-in-out infinite; }
     @keyframes xsearch-pulse { 0%,100% { box-shadow: 0 4px 16px rgba(88,101,242,0.5); } 50% { box-shadow: 0 4px 28px rgba(88,101,242,1); } }
+
+    /* Discord-style scrollbars -- scoped to overlay elements only, won't affect Discord's own UI */
+    #xsearch-body::-webkit-scrollbar, #xsearch-servers::-webkit-scrollbar { width: 16px; }
+    #xsearch-body::-webkit-scrollbar-track, #xsearch-servers::-webkit-scrollbar-track { background: transparent; }
+    #xsearch-body::-webkit-scrollbar-thumb, #xsearch-servers::-webkit-scrollbar-thumb { background: #5865f2; border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }
+    #xsearch-body::-webkit-scrollbar-thumb:hover, #xsearch-servers::-webkit-scrollbar-thumb:hover { background: #4752c4; border-radius: 8px; background-clip: content-box; }
+
+    /* Result card hover lift */
+    #xsearch-overlay .msg { transition: transform 120ms ease, background 0.1s ease; }
+    #xsearch-overlay .msg:hover { transform: translateX(3px); }
+
+    /* Button micro-press */
+    #xsearch-overlay button.act:active { transform: scale(0.96); transition: transform 80ms ease; }
+
+    /* Animations -- skipped for users who prefer reduced motion */
+    @media (prefers-reduced-motion: no-preference) {
+      #xsearch-overlay { animation: xsearch-appear 200ms ease-out both; }
+      @keyframes xsearch-appear { from { opacity: 0; transform: translateY(-8px) scale(0.98); } to { opacity: 1; transform: none; } }
+      #xsearch-overlay .msg.animating { animation: xsearch-card-in 140ms ease-out both; animation-delay: calc(var(--i, 0) * 18ms); }
+      @keyframes xsearch-card-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+      #xsearch-header.flash { animation: xsearch-header-flash 700ms ease-out both; }
+      @keyframes xsearch-header-flash { 0% { background: #1e1f22; } 25% { background: #2a2e38; } 100% { background: #1e1f22; } }
+      .group-cards-wrap { transition: grid-template-rows 280ms cubic-bezier(0.4, 0, 0.2, 1); }
+      .sk-line { animation: xsearch-shimmer 1.4s ease-in-out infinite; }
+      @keyframes xsearch-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+      #xsearch-progress-bar::after, #xsearch-header-progress-bar::after { content: ""; position: absolute; top: 0; left: -60%; bottom: 0; width: 60%; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent); animation: xsearch-bar-shimmer 1.6s ease-in-out infinite; }
+      @keyframes xsearch-bar-shimmer { 0% { left: -60%; } 100% { left: 140%; } }
+      #xsearch-overlay button.act.export-flash { animation: xsearch-export-pop 1.5s ease-out both; }
+      @keyframes xsearch-export-pop { 0% { filter: brightness(1.6); transform: scale(1.07); } 20% { filter: brightness(1.2); transform: scale(1.0); } 100% { filter: brightness(1); transform: scale(1); } }
+    }
   `;
 
   let _removeStyles = null;
@@ -603,6 +776,10 @@
         <button class="act" id="xsearch-go">Search all pages</button>
         <button class="act ghost" id="xsearch-stop" disabled>Stop</button>
         <button class="act alt" id="xsearch-export" disabled>Export CSV</button>
+        <label class="ctl-group" id="xsearch-self-wrap" title="Hide your own messages from results and CSV export">
+          <input type="checkbox" id="xsearch-exclude-self" style="width:14px;height:14px;flex-shrink:0;cursor:pointer;">
+          <span>Hide my messages</span>
+        </label>
         <span class="ctl-group">
           <label for="xsearch-concurrency" title="How many servers to search at once. Each server has its own rate-limit bucket on Discord's side, so 2-3 is faster without raising your per-bucket request rate.">Parallel</label>
           <select id="xsearch-concurrency">
@@ -613,18 +790,19 @@
             <option value="5">5 (fastest)</option>
           </select>
         </span>
-        <span class="ctl-group">
-          <label for="xsearch-timerange">Time range</label>
-          <select id="xsearch-timerange">
-            ${TIME_RANGE_OPTIONS.map(o => `<option value="${o.ms}"${o.ms === 0 ? " selected" : ""}>${o.label}</option>`).join("\n            ")}
-          </select>
-        </span>
-        <span class="ctl-group">
-          <label for="xsearch-server-delay" title="How long to wait between searching each server. Higher values are safer but slower.">Server delay</label>
-          <select id="xsearch-server-delay">
-            ${SERVER_DELAY_OPTIONS.map(o => `<option value="${o.ms}"${o.ms === 10_000 ? " selected" : ""}>${o.label}</option>`).join("\n            ")}
-          </select>
-        </span>
+        <div id="xsearch-options-row">
+          <span class="ctl-group" style="margin-left:0">
+            <select id="xsearch-timerange">
+              ${TIME_RANGE_OPTIONS.map(o => `<option value="${o.ms}"${o.ms === 0 ? " selected" : ""}>${o.label}</option>`).join("\n              ")}
+            </select>
+          </span>
+          <span class="ctl-group" style="margin-left:auto">
+            <label for="xsearch-server-delay" title="How long to wait between searching each server. Higher values are safer but slower.">Server delay</label>
+            <select id="xsearch-server-delay">
+              ${SERVER_DELAY_OPTIONS.map(o => `<option value="${o.ms}"${o.ms === 10_000 ? " selected" : ""}>${o.label}</option>`).join("\n              ")}
+            </select>
+          </span>
+        </div>
       </div>
       <div id="xsearch-servers-wrap">
         <div id="xsearch-servers-head">
@@ -856,6 +1034,15 @@
     else { folderCb.checked = false; folderCb.indeterminate = true; }
   };
 
+  // Updates the search button label based on whether every guild checkbox is checked.
+  const syncGoBtn = () => {
+    const goBtn = overlay.querySelector("#xsearch-go");
+    if (!goBtn) return;
+    const all = [...serversDiv.querySelectorAll("input[data-id]")];
+    const allChecked = all.length > 0 && all.every(c => c.checked);
+    goBtn.textContent = allChecked ? "Search all pages" : "Search selected";
+  };
+
   if (organizedGuilds) {
     for (const group of organizedGuilds) {
       if (group.type === "folder") {
@@ -898,6 +1085,7 @@
         folderCb.addEventListener("change", () => {
           for (const cb of serverCbs) cb.checked = folderCb.checked;
           folderCb.indeterminate = false;
+          syncGoBtn();
         });
 
         groupDiv.appendChild(serversInner);
@@ -914,11 +1102,19 @@
     }
   }
 
+  // Event delegation: catch individual guild checkbox changes not covered by folder handler.
+  serversDiv.addEventListener("change", e => {
+    if (e.target.matches("input[data-id]")) syncGoBtn();
+  });
+  syncGoBtn();
+
   overlay.querySelector("#xsearch-all").onclick = () => {
     serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => { c.checked = true; c.indeterminate = false; });
+    syncGoBtn();
   };
   overlay.querySelector("#xsearch-none").onclick = () => {
     serversDiv.querySelectorAll("input[type=checkbox]").forEach(c => { c.checked = false; c.indeterminate = false; });
+    syncGoBtn();
   };
 
   // Search state
@@ -927,6 +1123,41 @@
   let stopRequested = false;
   // hardKill is set on 401 or 403/40002; all workers exit immediately and the script must be re-injected.
   let hardKill = false;
+
+  // Progressive rendering state -- reset at the start of each search run.
+  let liveResults = [];
+  let _liveSeenIds = new Set();
+  let _liveRenderTimer = null;
+  // When true, renderResults() will add entry animations to new cards. Reset to false at the top of renderResults().
+  let _isLiveUpdate = false;
+  // IDs that were present in the last completed render; used to skip re-animating already-shown cards.
+  let _lastRenderedIds = new Set();
+
+  const _addLiveResults = (found) => {
+    for (const m of found) {
+      if (_liveSeenIds.has(m.id)) continue;
+      _liveSeenIds.add(m.id);
+      liveResults.push(m);
+    }
+  };
+
+  const debouncedLiveRender = () => {
+    if (_liveRenderTimer) clearTimeout(_liveRenderTimer);
+    _liveRenderTimer = setTimeout(() => {
+      _liveRenderTimer = null;
+      lastResults = liveResults;  // sync so getVisibleResults() sees the latest data
+      _isLiveUpdate = true;
+      renderResults();
+    }, 400);
+  };
+
+  // Returns the results to display, applying the self-exclusion filter if active.
+  // lastResults is never mutated -- toggling the filter is always instantly reversible.
+  const getVisibleResults = () => {
+    const excludeSelf = overlay.querySelector("#xsearch-exclude-self")?.checked;
+    if (!excludeSelf || !selfId) return lastResults;
+    return lastResults.filter(m => m.author?.id !== selfId);
+  };
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   // Jitter uses a right-skewed distribution to mimic real human browsing behavior:
@@ -957,17 +1188,28 @@
     if (minId) params.set("min_id", minId);
   };
 
+  let _hlCache = null;  // { query: string, re: RegExp | null }
+  const getHlRe = (query) => {
+    if (_hlCache?.query === query) return _hlCache.re;
+    const terms = query.split(/\s+/).filter(t => t.length >= 2);
+    const re = terms.length > 0
+      ? new RegExp(`(${terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "gi")
+      : null;
+    _hlCache = { query, re };
+    return re;
+  };
+
   // Highlights matching query terms in result content so the user can see why each result matched.
   const highlightInto = (parent, text, query) => {
     parent.textContent = "";
     if (!text) { parent.textContent = "(no text content)"; return; }
-    const terms = query.split(/\s+/).filter(t => t.length >= 2);
-    if (terms.length === 0) { parent.textContent = text; return; }
-    const escaped = terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    const re = new RegExp(`(${escaped.join("|")})`, "gi");
+    const re = getHlRe(query);
+    if (!re) { parent.textContent = text; return; }
+    re.lastIndex = 0;
     const parts = text.split(re);
     for (const p of parts) {
       if (!p) continue;
+      re.lastIndex = 0;
       if (re.test(p)) {
         re.lastIndex = 0;
         const span = document.createElement("span");
@@ -977,14 +1219,17 @@
       } else {
         parent.appendChild(document.createTextNode(p));
       }
-      re.lastIndex = 0;
     }
   };
 
-  const renderResult = (m) => {
-    const results = overlay.querySelector("#xsearch-results");
+  const renderResult = (container, m, opts = {}) => {
     const div = document.createElement("div");
     div.className = "msg";
+    if (opts.animate) {
+      div.classList.add("animating");
+      if (opts.staggerIndex != null && opts.staggerIndex < 8)
+        div.style.setProperty("--i", opts.staggerIndex);
+    }
     const date = new Date(m.timestamp).toLocaleString();
     const meta = document.createElement("div");
     meta.className = "meta";
@@ -995,12 +1240,15 @@
     div.appendChild(meta);
     div.appendChild(content);
     div.onclick = () => jumpToMessage(m._guildId, m.channel_id, m.id);
-    results.appendChild(div);
+    container.appendChild(div);
   };
 
+  // Lazily caches numeric timestamp on the message object to avoid repeated Date parsing in sorts.
+  const getTs = (m) => m._ts !== undefined ? m._ts : (m._ts = Date.parse(m.timestamp));
+
   const computeOrdered = (items, primary, secondary) => {
-    const cmpNewest = (a, b) => new Date(b.timestamp) - new Date(a.timestamp);
-    const cmpOldest = (a, b) => new Date(a.timestamp) - new Date(b.timestamp);
+    const cmpNewest = (a, b) => getTs(b) - getTs(a);
+    const cmpOldest = (a, b) => getTs(a) - getTs(b);
     const cmpAZ = (a, b) => (a.content || "").toLowerCase().localeCompare((b.content || "").toLowerCase());
     const withinTable = { newest: cmpNewest, oldest: cmpOldest, az: cmpAZ };
     const within = withinTable[secondary] || cmpNewest;
@@ -1018,7 +1266,7 @@
       let b = buckets.get(k);
       if (!b) { b = { key: k, label, items: [], maxTs: -Infinity }; buckets.set(k, b); }
       b.items.push(m);
-      const ts = +new Date(m.timestamp);
+      const ts = getTs(m);
       if (ts > b.maxTs) b.maxTs = ts;
     }
     const groups = [...buckets.values()];
@@ -1030,11 +1278,28 @@
 
   let _renderToken = 0;
   const renderResults = () => {
+    // Capture and immediately clear the live flag so sort/filter re-renders never animate cards.
+    const isLive = _isLiveUpdate;
+    _isLiveUpdate = false;
+
+    const body = overlay.querySelector("#xsearch-body");
+    const savedScroll = body ? body.scrollTop : 0;
+
+    // Remove skeleton scroll lock if present (set when skeletons were injected at search start).
+    if (body?.hasAttribute("data-skeleton-lock")) {
+      body.removeAttribute("data-skeleton-lock");
+      body.style.overflowY = "";
+    }
+
     const results = overlay.querySelector("#xsearch-results");
     const sortRow = overlay.querySelector("#xsearch-sort-row");
     const secondaryWrap = overlay.querySelector("#xsearch-secondary-wrap");
+    const exportBtn = overlay.querySelector("#xsearch-export");
     results.innerHTML = "";
-    if (!lastResults.length) {
+
+    const visible = getVisibleResults();
+    if (exportBtn) exportBtn.disabled = visible.length === 0;
+    if (!visible.length) {
       sortRow.classList.remove("visible");
       return;
     }
@@ -1044,7 +1309,13 @@
     const grouped = primary.startsWith("server") || primary.startsWith("user");
     secondaryWrap.classList.toggle("visible", grouped);
 
-    const groups = computeOrdered(lastResults, primary, secondary);
+    // Sort/filter re-render: snap opacity to 0 so new content fades in rather than snapping.
+    if (!isLive) {
+      results.style.transition = "none";
+      results.style.opacity = "0";
+    }
+
+    const groups = computeOrdered(visible, primary, secondary);
     const queue = [];
     for (const g of groups) {
       if (grouped) queue.push({ header: g.label, count: g.items.length });
@@ -1052,27 +1323,71 @@
     }
     const myToken = ++_renderToken;
     let i = 0;
+    let animCount = 0;
+    let currentGroupCards = null;
+    // Snapshot which IDs were already on screen before this render; only animate cards that weren't.
+    const prevIds = isLive ? new Set(_lastRenderedIds) : null;
+    const newRenderedIds = new Set();
     const renderChunk = () => {
       if (myToken !== _renderToken) return;
       const end = Math.min(queue.length, i + 50);
       for (; i < end; i++) {
         const it = queue[i];
         if ("header" in it) {
+          const groupBlock = document.createElement("div");
+          groupBlock.className = "group-block";
           const h = document.createElement("div");
           h.className = "group-header";
+          h.addEventListener("click", () => groupBlock.classList.toggle("collapsed"));
+          const toggle = document.createElement("span");
+          toggle.className = "toggle";
+          toggle.textContent = ">";
           const label = document.createElement("span");
           label.textContent = it.header;
           const count = document.createElement("span");
           count.className = "count";
           count.textContent = `(${it.count})`;
+          h.appendChild(toggle);
           h.appendChild(label);
           h.appendChild(count);
-          results.appendChild(h);
+          groupBlock.appendChild(h);
+          const wrap = document.createElement("div");
+          wrap.className = "group-cards-wrap";
+          const cards = document.createElement("div");
+          cards.className = "group-cards";
+          wrap.appendChild(cards);
+          groupBlock.appendChild(wrap);
+          results.appendChild(groupBlock);
+          currentGroupCards = cards;
         } else {
-          renderResult(it.msg);
+          const container = grouped && currentGroupCards ? currentGroupCards : results;
+          const isNew = prevIds ? !prevIds.has(it.msg.id) : false;
+          renderResult(container, it.msg, (isLive && isNew) ? { animate: true, staggerIndex: animCount++ } : {});
+          newRenderedIds.add(it.msg.id);
         }
       }
-      if (i < queue.length) requestAnimationFrame(renderChunk);
+      if (i < queue.length) {
+        requestAnimationFrame(renderChunk);
+      } else {
+        // All chunks done -- update rendered-ID tracking, then handle scroll.
+        _lastRenderedIds = newRenderedIds;
+        if (!isLive) {
+          // Fade results back in after the sort/filter re-render completes.
+          requestAnimationFrame(() => {
+            results.style.transition = "opacity 120ms ease";
+            results.style.opacity = "1";
+          });
+        }
+        if (body) {
+          if (isLive) {
+            // Progressive update: restore position so reading isn't interrupted.
+            body.scrollTop = savedScroll;
+          } else if (savedScroll > 0) {
+            // Sort/filter change: snap back to top so the user sees the re-ordered results.
+            body.scrollTo({ top: 0, behavior: "smooth" });
+          }
+        }
+      }
     };
     renderChunk();
   };
@@ -1351,6 +1666,23 @@
     headerProgressBar.style.width = "0%";
     headerProgressBar.classList.remove("done");
     headerProgress.classList.add("active");
+
+    // Inject skeleton placeholder cards and lock scrolling until real results arrive.
+    const body = overlay.querySelector("#xsearch-body");
+    if (body) {
+      const skFrag = document.createDocumentFragment();
+      for (let _s = 0; _s < 5; _s++) {
+        const sk = document.createElement("div");
+        sk.className = "msg skeleton";
+        sk.innerHTML = `<div class="sk-line sk-line-meta"></div>
+<div class="sk-line sk-line-content"></div>
+<div class="sk-line sk-line-content sk-short"></div>`;
+        skFrag.appendChild(sk);
+      }
+      results.appendChild(skFrag);
+      body.style.overflowY = "hidden";
+      body.setAttribute("data-skeleton-lock", "1");
+    }
     launcherRing.classList.remove("done");
     if (ringFadeTimer) { clearTimeout(ringFadeTimer); ringFadeTimer = null; }
     ringCircle.style.transition = "none";
@@ -1364,8 +1696,23 @@
     stopRequested = false;
     hardKill = false;
     lastResults = [];
+    // Reset progressive accumulator and cancel any pending debounced render from a previous run.
+    liveResults = [];
+    _liveSeenIds = new Set();
+    _lastRenderedIds = new Set();
+    if (_liveRenderTimer) { clearTimeout(_liveRenderTimer); _liveRenderTimer = null; }
+    // Retry self-detection if it failed at inject time (Discord panel may not have been mounted yet).
+    if (!selfId) {
+      const retry = getSelf();
+      if (retry) { selfId = retry.id; selfUsername = retry.username; }
+    }
 
     const finishSearchUi = (success = false) => {
+      // Remove skeleton scroll lock in case search ended before renderResults() had a chance to.
+      if (body?.hasAttribute("data-skeleton-lock")) {
+        body.removeAttribute("data-skeleton-lock");
+        body.style.overflowY = "";
+      }
       progressWrap.style.display = "none";
       launcher.classList.remove("searching");
       goBtn.disabled = false;
@@ -1375,6 +1722,12 @@
         headerProgressBar.classList.add("done");
         launcherRing.classList.add("done");
         fadeRingOut(700);
+        // Brief header flash to signal completion.
+        const hdr = overlay.querySelector("#xsearch-header");
+        if (hdr) {
+          hdr.classList.add("flash");
+          setTimeout(() => hdr.classList.remove("flash"), 750);
+        }
         setTimeout(() => {
           headerProgress.classList.remove("active");
           setTimeout(() => {
@@ -1399,7 +1752,6 @@
       return;
     }
 
-    const all = [];
     const total = checked.length;
     let completedServers = 0;
     const serverProgress = new Map(); // guildId -> [0..1]
@@ -1417,7 +1769,7 @@
     const renderStatus = (extra = "") => {
       const inFlight = serverProgress.size;
       status.textContent =
-        `${completedServers}/${total} servers done, ${inFlight} active, ${all.length} results` +
+        `${completedServers}/${total} servers done, ${inFlight} active, ${liveResults.length} results` +
         (extra ? ` - ${extra}` : "");
     };
 
@@ -1442,7 +1794,8 @@
         }
       }, rangeMs);
 
-      for (const m of found) all.push(m);
+      _addLiveResults(found);
+      debouncedLiveRender();
       serverProgress.delete(g.id);
       completedServers++;
       updateProgress();
@@ -1454,32 +1807,40 @@
       if (!stopRequested && !hardKill && serverDelayMs > 0 && completedServers < total) await jitteredSleep(serverDelayMs);
     }, concurrency);
 
-    // Dedup by message ID; cursor and offset modes can occasionally return overlapping pages.
-    const seenIds = new Set();
-    const deduped = [];
-    for (const m of all) {
-      if (seenIds.has(m.id)) continue;
-      seenIds.add(m.id);
-      deduped.push(m);
-    }
-    deduped.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    lastResults = deduped;
+    // Cancel any pending debounced live render -- the final renderResults() call below covers it.
+    if (_liveRenderTimer) { clearTimeout(_liveRenderTimer); _liveRenderTimer = null; }
+    // liveResults is already deduplicated incrementally via _liveSeenIds.
+    lastResults = liveResults;
 
+    const visible = getVisibleResults();
     let finalNote = "";
     if (hardKill) finalNote = " (HALTED: token rejected or account flagged - re-inject script)";
     else if (stopRequested) finalNote = " (stopped early)";
-    status.textContent = `${deduped.length} total results across ${total} servers${finalNote}`;
+    const hidden = lastResults.length - visible.length;
+    if (hidden > 0) finalNote += ` (${hidden} hidden – your messages)`;
+    status.textContent = `${visible.length} total results across ${total} servers${finalNote}`;
     progressBar.style.width = "100%";
     headerProgressBar.style.width = "100%";
     ringCircle.style.strokeDashoffset = 0;
-    exportBtn.disabled = deduped.length === 0;
+    exportBtn.disabled = visible.length === 0;
     finishSearchUi(true);
 
+    // Animate cards that weren't shown in any prior live render (covers fast and multi-server searches).
+    _isLiveUpdate = true;
     renderResults();
   };
 
   overlay.querySelector("#xsearch-sort-primary").onchange = renderResults;
   overlay.querySelector("#xsearch-sort-secondary").onchange = renderResults;
+  overlay.querySelector("#xsearch-exclude-self")?.addEventListener("change", renderResults);
+  // Disable exclude-self checkbox if self-ID could not be detected.
+  if (!selfId) {
+    const selfCb = overlay.querySelector("#xsearch-exclude-self");
+    if (selfCb) {
+      selfCb.disabled = true;
+      selfCb.closest("label")?.setAttribute("title", "Could not detect your user ID");
+    }
+  }
 
   // CSV export (local file download only, no network requests)
   const csvEscape = (v) => {
@@ -1490,10 +1851,11 @@
   };
 
   const exportCsv = () => {
-    if (!lastResults.length) return;
+    const exportable = getVisibleResults();
+    if (!exportable.length) return;
     const headers = ["timestamp", "server", "channel_id", "author", "content", "link"];
     const rows = [headers.join(",")];
-    for (const m of lastResults) {
+    for (const m of exportable) {
       // This URL is written into the CSV for the user to click later, not fetched here
       const link = `https://discord.com/channels/${m._guildId}/${m.channel_id}/${m.id}`;
       rows.push([
@@ -1516,6 +1878,14 @@
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+    // Briefly animate the export button to confirm the download was triggered.
+    const btn = overlay.querySelector("#xsearch-export");
+    if (btn) {
+      const orig = btn.textContent;
+      btn.textContent = "Exported!";
+      btn.classList.add("export-flash");
+      setTimeout(() => { btn.classList.remove("export-flash"); btn.textContent = orig; }, 1500);
+    }
   };
 
   overlay.querySelector("#xsearch-go").onclick = () => {
